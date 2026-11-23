@@ -296,7 +296,8 @@ select:focus-visible {
   width: 100%;
   height: 100%;
   min-height: 220px;
-  object-fit: cover;
+  object-fit: contain;
+  object-position: center;
   background: var(--accent-muted);
 }
 .image-placeholder {
@@ -555,6 +556,107 @@ select:focus-visible {
   font-weight: 800;
   letter-spacing: -0.03em;
 }
+.access-settings {
+  max-width: 880px;
+  border-top: 4px solid var(--ink);
+  background: var(--surface);
+}
+.access-setting-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--gutter);
+  border-bottom: var(--hairline);
+  padding: var(--space-6) 0;
+}
+.access-setting-row h2 {
+  margin: 0 0 var(--space-2);
+  color: var(--ink);
+  font-size: var(--type-xl);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+.access-setting-row p:not(.eyebrow) {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.access-switch {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto 56px;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--ink);
+  font-weight: 700;
+  cursor: pointer;
+}
+.access-switch input {
+  position: absolute;
+  z-index: 1;
+  right: 0;
+  width: 56px;
+  height: 36px;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.access-switch-control {
+  position: relative;
+  grid-column: 2;
+  width: 56px;
+  height: 32px;
+  border: var(--border);
+  background: var(--surface-muted);
+  transition: background var(--motion-fast) var(--ease-standard);
+}
+.access-switch-control::before {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 22px;
+  height: 22px;
+  border: var(--hairline);
+  background: var(--surface);
+  content: '';
+  transition: transform var(--motion-fast) var(--ease-standard);
+}
+.access-switch input:checked + .access-switch-control { background: var(--ink); }
+.access-switch input:checked + .access-switch-control::before { transform: translateX(24px); }
+.access-switch input:focus-visible + .access-switch-control {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+.access-switch input:disabled { cursor: progress; }
+.access-switch input:disabled + .access-switch-control { opacity: 0.6; }
+.access-status {
+  margin: var(--space-4) 0 0;
+  color: var(--ink);
+  font-size: var(--type-sm);
+  font-weight: 700;
+  line-height: 1.5;
+}
+.tunnel-address {
+  display: grid;
+  gap: var(--space-1);
+  border-left: 4px solid var(--accent);
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-muted);
+}
+.tunnel-address span,
+.access-note {
+  color: var(--muted);
+  font-size: var(--type-sm);
+  line-height: 1.6;
+}
+.tunnel-address strong {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.access-note { margin: var(--space-5) 0 0; }
+.access-note code { color: var(--ink); font-family: var(--font-sans); font-weight: 700; }
 .catalog-checklist {
   border: 0;
   margin: var(--space-6) 0;
@@ -688,7 +790,9 @@ select:focus-visible {
 .edit-material-image > .image-placeholder {
   width: 160px;
   height: 120px;
-  object-fit: cover;
+  object-fit: contain;
+  object-position: center;
+  background: var(--surface-muted);
 }
 .status-checkbox {
   display: flex;
@@ -740,7 +844,13 @@ select:focus-visible {
 .catalog-card:nth-child(2) { animation-delay: 40ms; }
 .catalog-card:nth-child(3) { animation-delay: 80ms; }
 .catalog-card > img,
-.catalog-card > .image-placeholder { width: 100%; height: 220px; object-fit: cover; }
+.catalog-card > .image-placeholder {
+  width: 100%;
+  height: 220px;
+  object-fit: contain;
+  object-position: center;
+  background: var(--surface-muted);
+}
 .catalog-card-content { padding: var(--space-5); }
 .catalog-card-content h2 {
   margin: 0 0 var(--space-2);
@@ -933,7 +1043,8 @@ th {
   width: 52px;
   height: 52px;
   border: var(--hairline);
-  object-fit: cover;
+  object-fit: contain;
+  object-position: center;
   background: var(--accent-muted);
 }
 .rank-placeholder { display: grid; place-items: center; color: var(--ink); font-size: var(--type-xs); font-weight: 800; }

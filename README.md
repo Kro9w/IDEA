@@ -47,7 +47,7 @@ Open the administration interface on the host laptop:
 http://localhost:5173
 ```
 
-Do not use `localhost` addresses on visitor phones. IDEA generates QR codes using a reachable LAN address.
+Do not use `localhost` addresses on visitor phones. By default, IDEA generates QR codes using a reachable LAN address.
 
 ## Local network setup
 
@@ -62,6 +62,20 @@ http://<laptop-lan-ip>:5173
 
 5. Keep the application terminal open during the exhibit.
 
+### Optional Cloudflare visitor access
+
+Use this when visitor phones cannot join the host laptop’s Wi-Fi network. Cloudflare Quick Tunnels create a temporary public `trycloudflare.com` address; they do not require a domain or a Cloudflare account, but the address changes when the tunnel restarts.
+
+1. Install `cloudflared` on the host laptop (on macOS, `brew install cloudflared`).
+2. Keep IDEA running and make sure the host has internet access.
+3. In IDEA, open **Settings** and enable **Cloudflare tunnel**.
+4. Wait for the tunnel to become ready, then open the session’s **QR code**. It will use the temporary Cloudflare address.
+5. Disable the setting to stop the tunnel and return future QR codes to the local network address.
+
+Phones scanning a Cloudflare QR code need internet access. The tunnel is limited to visitor session pages, IEC images, and distribution submissions; administration and distribution records remain available only on the host/local network. Keep the application running while the tunnel is in use. Install `cloudflared` and restart IDEA if the setting reports that the command cannot be found.
+
+The tunnel is started on demand by the setting and stopped when switched off or when IDEA shuts down. In development it targets Vite on port `5173`; in production it targets the server port (default `3001`).
+
 If a QR code cannot be opened:
 
 - Confirm every device is on the same Wi-Fi network.
@@ -69,7 +83,7 @@ If a QR code cannot be opened:
 - Allow Node.js and the IDE/Terminal app through the macOS firewall.
 - Reopen or regenerate the QR code after network or laptop IP changes.
 
-The QR code endpoint uses `IDEA_PUBLIC_URL` when configured. Otherwise, it selects a LAN IPv4 address automatically.
+In local-network mode, the QR code endpoint uses `IDEA_PUBLIC_URL` when configured. Otherwise, it selects a LAN IPv4 address automatically. Cloudflare mode uses the active Quick Tunnel address.
 
 ## Create a staff directory
 
@@ -211,9 +225,11 @@ IDEA_DATA_DIR=data
 IDEA_UPLOAD_DIR=uploads
 IDEA_PUBLIC_URL=http://192.168.1.100:5173
 IDEA_PUBLIC_PORT=5173
+CLOUDFLARED_PATH=/path/to/cloudflared
+IDEA_TUNNEL_TARGET=http://127.0.0.1:5173
 ```
 
-`IDEA_PUBLIC_URL` is useful when a fixed LAN address or a production host is known.
+`IDEA_PUBLIC_URL` is useful when a fixed LAN address or a production host is known. `CLOUDFLARED_PATH` is only needed when the executable is not on the server’s `PATH`. `IDEA_TUNNEL_TARGET` overrides the local app address Cloudflare forwards to; normally it should be left unset.
 
 ## Development commands
 

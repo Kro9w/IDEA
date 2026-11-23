@@ -9,6 +9,11 @@ import QRCode from 'qrcode'
 import sharp from 'sharp'
 import { z } from 'zod'
 import { db } from './db.js'
+import {
+  getCloudflareTunnelStatus,
+  startCloudflareTunnel,
+  stopCloudflareTunnel,
+} from './cloudflareTunnel.js'
 
 export const apiRouter = express.Router()
 
@@ -91,7 +96,11 @@ function routeParam(request: Request, name: 'id' | 'sessionId'): string {
   return Array.isArray(value) ? value[0] : value
 }
 
-function publicOrigin(request: Request): string {
+const tunnelStartSchema = z.object({
+  webPort: z.number().int().min(1).max(65_535).optional(),
+})
+
+function publicOrigin(request: Request, webPort?: number): string {
   if (process.env.IDEA_PUBLIC_URL) {
     return process.env.IDEA_PUBLIC_URL.replace(/\/$/, '')
   }
@@ -111,13 +120,33 @@ function publicOrigin(request: Request): string {
   if (!address) return `${request.protocol}://${host ?? '127.0.0.1'}`
 
   const port = process.env.IDEA_PUBLIC_PORT
-    ?? (process.env.NODE_ENV === 'production' ? '3001' : '5173')
+    ?? (process.env.NODE_ENV === 'production' ? '3001' : String(webPort ?? 5173))
   return `http://${address.address}:${port}`
 }
 
 apiRouter.get('/health', (_request, response) => {
   const result = db.prepare('SELECT 1 AS ok').get() as { ok: number }
   response.json({ status: 'ok', database: result.ok === 1 ? 'connected' : 'error' })
+})
+
+apiRouter.get('/tunnel/status', (_request, response) => {
+  response.json(getCloudflareTunnelStatus())
+})
+
+apiRouter.post('/tunnel/start', async (request, response) => {
+  const body = parseBody(tunnelStartSchema, request, response)
+  if (!body) return
+  try {
+    const url = await startCloudflareTunnel(body.webPort)
+    response.json({ running: true, url })
+  } catch (error) {
+    sendError(response, 503, error instanceof Error ? error.message : 'Could not start the Cloudflare tunnel')
+  }
+})
+
+apiRouter.post('/tunnel/stop', async (_request, response) => {
+  await stopCloudflareTunnel()
+  response.json({ running: false, url: null })
 })
 
 apiRouter.get('/sessions', (_request, response) => {
@@ -294,7 +323,30 @@ apiRouter.get('/sessions/:id/qr', async (request, response) => {
     sendError(response, 404, 'Session not found')
     return
   }
-  const origin = publicOrigin(request)
+  const requestedMode = request.query.mode ?? 'lan'
+  if (requestedMode !== 'lan' && requestedMode !== 'cloudflare') {
+    sendError(response, 400, 'QR access mode must be lan or cloudflare')
+    return
+  }
+  const rawWebPort = request.query.webPort
+  let webPort: number | undefined
+  if (rawWebPort !== undefined) {
+    const parsedPort = z.coerce.number().int().min(1).max(65_535).safeParse(rawWebPort)
+    if (!parsedPort.success) {
+      sendError(response, 400, 'Invalid web server port')
+      return
+    }
+    webPort = parsedPort.data
+  }
+  let origin = publicOrigin(request, webPort)
+  if (requestedMode === 'cloudflare') {
+    const tunnel = getCloudflareTunnelStatus()
+    if (!tunnel.running || !tunnel.url) {
+      sendError(response, 503, 'Start the Cloudflare tunnel in Settings before generating this QR code')
+      return
+    }
+    origin = tunnel.url
+  }
   const url = `${origin}/session/${encodeURIComponent(request.params.id)}`
   try {
     const dataUrl = await QRCode.toDataURL(url, { width: 480, margin: 2 })
