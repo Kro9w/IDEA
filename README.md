@@ -167,16 +167,13 @@ Corrections and voids preserve the original audit trail. Exports contain only ac
 
 The dashboard contains:
 
-- Institution-wide totals
-- A selectable exhibit overview
-- Male and female patron counts and percentages
-- Distribution trends
-- Most-distributed IEC materials
-- Distribution by exhibit
-- Distribution by staff
+- Institution-wide totals and independently selectable exhibit statistics
+- Visitor profile breakdowns by sex, age range, city/province, sector, and IEC purpose
+- Distribution trends, popular IEC materials, exhibit comparisons, and staff activity
 - Recent distribution activity
+- A shared date range for distribution-based statistics
 
-Sex percentages use patrons with `Male` or `Female` recorded sex as the known-sex denominator.
+Profile bars show counts and percentages of non-voided distribution visits in the current date range (and selected exhibit where applicable). Repeat visits are counted as visits, not deduplicated people. Missing profile fields are shown as **Not recorded**; optional sector and purpose responses are not imputed. The headline unique-patron count is deduplicated using recorded name + sex and is distinct from submission counts. Exhibit selection changes only the exhibit-specific analysis, not institution-wide totals.
 
 ## Excel export
 

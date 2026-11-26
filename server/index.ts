@@ -20,11 +20,16 @@ app.use((request, response, next) => {
   const visitorPage = request.method === 'GET' && /^\/session\/[^/]+\/?$/.test(request.path)
   const visitorSession = request.method === 'GET' && /^\/api\/sessions\/[^/]+$/.test(request.path)
   const visitorSubmission = request.method === 'POST' && /^\/api\/sessions\/[^/]+\/distributions$/.test(request.path)
+  const visitorLocation = request.method === 'GET' && (
+    request.path === '/api/locations/regions'
+    || /^\/api\/locations\/regions\/[^/]+\/provinces$/.test(request.path)
+    || /^\/api\/locations\/provinces\/[^/]+\/cities$/.test(request.path)
+  )
   const visitorImage = request.method === 'GET' && /^\/uploads\/[^/]+$/.test(request.path)
   const visitorAsset = request.method === 'GET'
     && (request.path.startsWith('/assets/') || request.path === '/NFRDI.png')
 
-  if (visitorPage || visitorSession || visitorSubmission || visitorImage || visitorAsset) {
+  if (visitorPage || visitorSession || visitorSubmission || visitorLocation || visitorImage || visitorAsset) {
     next()
     return
   }

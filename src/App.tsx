@@ -3,6 +3,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState,
   type FormEvent,
@@ -23,6 +24,11 @@ type Session = {
   status: "active" | "completed";
   created_at: string;
   distributor_name?: string | null;
+  distributor_staff_id?: string | null;
+  location_region?: string | null;
+  location_province?: string | null;
+  location_city?: string | null;
+  location_details?: string | null;
 };
 
 type Material = {
@@ -32,6 +38,10 @@ type Material = {
   identifying_details: string | null;
   image_path: string | null;
   active: number;
+  stock_quantity?: number;
+  visitor_limit?: number;
+  distributed_quantity?: number;
+  requires_social_checklist?: number;
 };
 
 type Staff = {
@@ -42,6 +52,38 @@ type Staff = {
 
 type VisitorAccessMode = "lan" | "cloudflare";
 type TunnelStatus = { running: boolean; url: string | null };
+type PHArea = { name: string; psgcCode: string };
+
+const SOCIAL_LINKS = [
+  {
+    id: "facebook",
+    label: "NFRDI Facebook Page",
+    url: "https://web.facebook.com/nfrdiphilippines",
+    required: true,
+    action: "Like and follow",
+  },
+  {
+    id: "tpjf",
+    label: "TPJF Facebook Page",
+    url: "https://web.facebook.com/TPJFNFRDI",
+    required: true,
+    action: "Like and follow",
+  },
+  {
+    id: "youtube",
+    label: "NFRDI YouTube",
+    url: "https://www.youtube.com/@NFRDI_PHILIPPINES",
+    required: true,
+    action: "Subscribe",
+  },
+  {
+    id: "x",
+    label: "NFRDI on X",
+    url: "https://x.com/DA_NFRDI",
+    required: false,
+    action: "Follow (optional)",
+  },
+];
 
 type Entry = {
   id: string;
@@ -99,6 +141,15 @@ function normalizePersonName(value: string): string {
     );
 }
 
+function isInvertedName(value: string): boolean {
+  const parts = value.split(",").map((part) => part.trim());
+  return (
+    parts.length === 2 &&
+    parts.every((part) => part.length > 0) &&
+    /^[\p{L}\p{M}][\p{L}\p{M} .'-]*$/u.test(parts.join(" "))
+  );
+}
+
 function Brand() {
   return (
     <div className="brand" aria-label="IDEA">
@@ -114,12 +165,14 @@ function Modal({
   children,
   onClose,
   size = "standard",
+  showClose = true,
 }: {
   eyebrow: string;
   title: string;
   children: ReactNode;
   onClose: () => void;
   size?: "standard" | "wide";
+  showClose?: boolean;
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -197,14 +250,16 @@ function Modal({
         aria-modal="true"
         aria-labelledby="central-modal-title"
       >
-        <button
-          className="dialog-close"
-          type="button"
-          aria-label="Close dialog"
-          onClick={onClose}
-        >
-          ×
-        </button>
+        {showClose && (
+          <button
+            className="dialog-close"
+            type="button"
+            aria-label="Close dialog"
+            onClick={onClose}
+          >
+            ×
+          </button>
+        )}
         <header className="modal-header">
           <p className="eyebrow">{eyebrow}</p>
           <h2 id="central-modal-title">{title}</h2>
@@ -230,6 +285,27 @@ function VisitorView({ sessionId }: { sessionId: string }) {
   const [materials, setMaterials] = useState<Material[]>([]);
   const [name, setName] = useState("");
   const [sex, setSex] = useState("Female");
+  const [ageRange, setAgeRange] = useState("");
+  const [regions, setRegions] = useState<PHArea[]>([]);
+  const [provinces, setProvinces] = useState<PHArea[]>([]);
+  const [cities, setCities] = useState<PHArea[]>([]);
+  const [region, setRegion] = useState("");
+  const [province, setProvince] = useState("");
+  const [city, setCity] = useState("");
+  const [sector, setSector] = useState("");
+  const [purpose, setPurpose] = useState("");
+  const [otherPurpose, setOtherPurpose] = useState("");
+  const [privacyChecked, setPrivacyChecked] = useState(false);
+  const [privacyNoticeRead, setPrivacyNoticeRead] = useState(false);
+  const [privacyAccepted, setPrivacyAccepted] = useState(false);
+  const [showSocialChecklist, setShowSocialChecklist] = useState(false);
+  const [socialChecks, setSocialChecks] = useState<Record<string, boolean>>({});
+  const [pendingSocialId, setPendingSocialId] = useState<string | null>(null);
+  const closeSocialChecklist = useCallback(
+    () => setShowSocialChecklist(false),
+    [],
+  );
+  const keepPrivacyModalOpen = useCallback(() => {}, []);
   const [quantities, setQuantities] = useState<Record<string, number>>({});
   const [error, setError] = useState("");
   const [submitted, setSubmitted] = useState(false);
@@ -238,25 +314,83 @@ function VisitorView({ sessionId }: { sessionId: string }) {
     (quantity) => quantity > 0,
   );
   const canSubmit =
-    name.trim().length > 0 && sex.length > 0 && hasSelectedMaterial;
+    isInvertedName(name) &&
+    Boolean(ageRange && region && province && city) &&
+    (purpose !== "Other" || otherPurpose.trim().length > 0) &&
+    sex.length > 0 &&
+    hasSelectedMaterial;
+  const needsSocialChecklist = materials.some(
+    (material) =>
+      material.requires_social_checklist === 1 &&
+      (quantities[material.id] ?? 0) > 0,
+  );
+  const requiredSocialsComplete = SOCIAL_LINKS.filter(
+    (item) => item.required,
+  ).every((item) => socialChecks[item.id] === true);
 
   useEffect(() => {
-    api<{ session: Session; materials: Material[] }>(
-      `/api/sessions/${sessionId}`,
-    )
-      .then((details) => {
+    if (submitted) return;
+    api<PHArea[]>("/api/locations/regions")
+      .then(setRegions)
+      .catch(() => setError("Could not load Philippine locations"));
+    let active = true;
+    const refreshSession = async (showError: boolean) => {
+      try {
+        const details = await api<{ session: Session; materials: Material[] }>(
+          `/api/sessions/${sessionId}`,
+        );
+        if (!active) return;
         setSession(details.session);
         setMaterials(details.materials);
-      })
-      .catch((reason: unknown) =>
-        setError(
-          reason instanceof Error ? reason.message : "Could not load session",
-        ),
-      );
-  }, [sessionId]);
+        setQuantities((current) => {
+          const next = { ...current };
+          const availableById = new Map(
+            details.materials.map((material) => [
+              material.id,
+              Math.max(
+                0,
+                (material.stock_quantity ?? 0) -
+                  (material.distributed_quantity ?? 0),
+              ),
+            ]),
+          );
+          for (const [materialId, quantity] of Object.entries(next)) {
+            const material = details.materials.find(
+              (item) => item.id === materialId,
+            );
+            if (!material) {
+              next[materialId] = 0;
+              continue;
+            }
+            const available = availableById.get(materialId) ?? 0;
+            next[materialId] = Math.min(
+              quantity,
+              available,
+              material.visitor_limit ?? 1,
+            );
+          }
+          return next;
+        });
+      } catch (reason) {
+        if (active && showError) {
+          setError(
+            reason instanceof Error ? reason.message : "Could not load session",
+          );
+        }
+      }
+    };
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
+    void refreshSession(true);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshSession(false);
+    }, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [sessionId, submitted]);
+
+  async function sendDistribution() {
     if (isSubmitting) return;
     setError("");
     const entries = Object.entries(quantities)
@@ -270,8 +404,23 @@ function VisitorView({ sessionId }: { sessionId: string }) {
     try {
       await api(`/api/sessions/${sessionId}/distributions`, {
         method: "POST",
-        body: JSON.stringify({ name, sex, entries }),
+        body: JSON.stringify({
+          name,
+          sex,
+          ageRange,
+          region,
+          province,
+          city,
+          sector: sector || undefined,
+          purpose:
+            purpose === "Other"
+              ? `Other: ${otherPurpose.trim()}`
+              : purpose || undefined,
+          privacyAccepted: true,
+          entries,
+        }),
       });
+      setShowSocialChecklist(false);
       setSubmitted(true);
       window.scrollTo({
         top: 0,
@@ -284,6 +433,17 @@ function VisitorView({ sessionId }: { sessionId: string }) {
     } finally {
       setIsSubmitting(false);
     }
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (isSubmitting) return;
+    setError("");
+    if (needsSocialChecklist) {
+      setShowSocialChecklist(true);
+      return;
+    }
+    await sendDistribution();
   }
 
   if (submitted) {
@@ -339,6 +499,75 @@ function VisitorView({ sessionId }: { sessionId: string }) {
       </main>
     );
 
+  if (session.status === "active" && !privacyAccepted) {
+    return (
+      <main className="visitor-page">
+        <Modal
+          eyebrow="Privacy notice"
+          title="Before you begin"
+          onClose={keepPrivacyModalOpen}
+          showClose={false}
+        >
+          <p>
+            Scroll through the notice to its end to enable the acknowledgement.
+          </p>
+          <div
+            className="privacy-notice-scroll"
+            role="region"
+            aria-label="Data privacy notice"
+            tabIndex={0}
+            onScroll={(event) => {
+              const notice = event.currentTarget;
+              if (
+                notice.scrollTop + notice.clientHeight >=
+                notice.scrollHeight - 4
+              ) {
+                setPrivacyNoticeRead(true);
+              }
+            }}
+          >
+            <p>
+              <strong>DATA PRIVACY NOTICE:</strong> DA-NFRDI values the
+              confidentiality of personal data, in accordance with the Data
+              Privacy Act of 2012, its Implementing Rules and Regulations (IRR),
+              other issuances of the National Privacy Commission, and other
+              relevant laws in the Philippines. By signing this form, I give my
+              full consent to the National Fisheries Research and Development
+              Institute (NFRDI) to collect and use my personal information for
+              official purposes. I also authorize NFRDI to use data to be
+              collected for the purpose of processing, promotion and marketing
+              in its official communication channels, research and analytics,
+              monitoring and compliance with institutional and regulatory
+              requirements. I understand that I may withdraw my consent at any
+              time by providing written notice to NFRDI.
+            </p>
+          </div>
+          <label className="privacy-acknowledgement">
+            <input
+              type="checkbox"
+              checked={privacyChecked}
+              disabled={!privacyNoticeRead}
+              onChange={(event) => setPrivacyChecked(event.target.checked)}
+            />
+            <span>
+              I have read and acknowledge the data privacy collection notice.
+            </span>
+          </label>
+          <div className="button-row">
+            <button
+              className="button primary"
+              type="button"
+              disabled={!privacyNoticeRead || !privacyChecked}
+              onClick={() => setPrivacyAccepted(true)}
+            >
+              Continue
+            </button>
+          </div>
+        </Modal>
+      </main>
+    );
+  }
+
   return (
     <main className="visitor-page">
       <header className="visitor-header">
@@ -374,11 +603,158 @@ function VisitorView({ sessionId }: { sessionId: string }) {
                   onBlur={() =>
                     setName((current) => normalizePersonName(current))
                   }
+                  pattern="[^,]+,\s*[^,]+"
+                  title="Enter your name as Surname, First name MI (for example, Dela Cruz, Juan D.)."
+                  placeholder="Surname, First name MI "
                   required
                   maxLength={200}
                   autoComplete="name"
                 />
               </label>
+              <label>
+                <span>Age range</span>
+                <select
+                  value={ageRange}
+                  onChange={(event) => setAgeRange(event.target.value)}
+                  required
+                >
+                  <option value="">Select age range</option>
+                  {[
+                    "0–12",
+                    "13–17",
+                    "18–24",
+                    "25–34",
+                    "35–44",
+                    "45–54",
+                    "55–64",
+                    "65+",
+                  ].map((range) => (
+                    <option key={range}>{range}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Region</span>
+                <select
+                  value={region}
+                  onChange={async (event) => {
+                    const code = event.target.value;
+                    setRegion(code);
+                    setProvince("");
+                    setCity("");
+                    setCities([]);
+                    setProvinces(
+                      code
+                        ? await api<PHArea[]>(
+                            `/api/locations/regions/${code}/provinces`,
+                          )
+                        : [],
+                    );
+                  }}
+                  required
+                >
+                  <option value="">Select region</option>
+                  {regions.map((item) => (
+                    <option key={item.psgcCode} value={item.psgcCode}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Province</span>
+                <select
+                  value={province}
+                  onChange={async (event) => {
+                    const code = event.target.value;
+                    setProvince(code);
+                    setCity("");
+                    setCities(
+                      code
+                        ? await api<PHArea[]>(
+                            `/api/locations/provinces/${code}/cities`,
+                          )
+                        : [],
+                    );
+                  }}
+                  required
+                  disabled={!region}
+                >
+                  <option value="">Select province</option>
+                  {provinces.map((item) => (
+                    <option key={item.psgcCode} value={item.psgcCode}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>City</span>
+                <select
+                  value={city}
+                  onChange={(event) => setCity(event.target.value)}
+                  required
+                  disabled={!province}
+                >
+                  <option value="">Select city</option>
+                  {cities.map((item) => (
+                    <option key={item.psgcCode} value={item.psgcCode}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Sector (optional)</span>
+                <select
+                  value={sector}
+                  onChange={(event) => setSector(event.target.value)}
+                >
+                  <option value="">Select sector</option>
+                  {["Government", "Private", "Academe", "Independent"].map(
+                    (value) => (
+                      <option key={value}>{value}</option>
+                    ),
+                  )}
+                </select>
+              </label>
+              <label>
+                <span>Purpose of the IECs (optional)</span>
+                <select
+                  value={purpose}
+                  onChange={(event) => {
+                    setPurpose(event.target.value);
+                    if (event.target.value !== "Other") setOtherPurpose("");
+                  }}
+                >
+                  <option value="">Select purpose</option>
+                  {[
+                    "General Interest",
+                    "Teaching Material",
+                    "Government Reference",
+                    "Professional Application",
+                    "Media",
+                    "Archive",
+                    "Other",
+                  ].map((item) => (
+                    <option key={item}>{item}</option>
+                  ))}
+                </select>
+              </label>
+              {purpose === "Other" && (
+                <label>
+                  <span>Specify purpose</span>
+                  <input
+                    value={otherPurpose}
+                    onChange={(event) => setOtherPurpose(event.target.value)}
+                    maxLength={100}
+                    pattern=".*\\S.*"
+                    title="Enter a short purpose."
+                    placeholder="Briefly describe the purpose"
+                    required
+                  />
+                </label>
+              )}
               <fieldset className="sex-switch">
                 <legend>Sex</legend>
                 {["Female", "Male"].map((option) => (
@@ -413,6 +789,15 @@ function VisitorView({ sessionId }: { sessionId: string }) {
               <div className="material-grid">
                 {materials.map((material) => {
                   const quantity = quantities[material.id] ?? 0;
+                  const available = Math.max(
+                    0,
+                    (material.stock_quantity ?? 0) -
+                      (material.distributed_quantity ?? 0),
+                  );
+                  const maxQuantity = Math.min(
+                    material.visitor_limit ?? 1,
+                    available,
+                  );
                   return (
                     <article
                       className={`material-card ${quantity > 0 ? "selected" : ""}`}
@@ -437,48 +822,66 @@ function VisitorView({ sessionId }: { sessionId: string }) {
                         {material.identifying_details && (
                           <p>{material.identifying_details}</p>
                         )}
-                        <div className="quantity-control">
-                          <button
-                            type="button"
-                            aria-label={`Decrease ${material.title ?? material.author_editor}`}
-                            onClick={() =>
-                              setQuantities((current) => ({
-                                ...current,
-                                [material.id]: Math.max(0, quantity - 1),
-                              }))
-                            }
-                          >
-                            −
-                          </button>
-                          <input
-                            aria-label="Quantity"
-                            type="number"
-                            min="0"
-                            max="999"
-                            value={quantity}
-                            onChange={(event) =>
-                              setQuantities((current) => ({
-                                ...current,
-                                [material.id]: Math.max(
-                                  0,
-                                  Math.min(999, Number(event.target.value)),
-                                ),
-                              }))
-                            }
-                          />
-                          <button
-                            type="button"
-                            aria-label={`Increase ${material.title ?? material.author_editor}`}
-                            onClick={() =>
-                              setQuantities((current) => ({
-                                ...current,
-                                [material.id]: Math.min(999, quantity + 1),
-                              }))
-                            }
-                          >
-                            +
-                          </button>
-                        </div>
+                        {available === 0 ? (
+                          <p className="sold-out" role="status">
+                            Sold out
+                          </p>
+                        ) : (
+                          <>
+                            <div className="quantity-control">
+                              <button
+                                type="button"
+                                aria-label={`Decrease ${material.title ?? material.author_editor}`}
+                                onClick={() =>
+                                  setQuantities((current) => ({
+                                    ...current,
+                                    [material.id]: Math.max(0, quantity - 1),
+                                  }))
+                                }
+                              >
+                                −
+                              </button>
+                              <input
+                                aria-label="Quantity"
+                                type="number"
+                                min="0"
+                                max={maxQuantity}
+                                value={quantity}
+                                onChange={(event) =>
+                                  setQuantities((current) => ({
+                                    ...current,
+                                    [material.id]: Math.max(
+                                      0,
+                                      Math.min(
+                                        maxQuantity,
+                                        Number(event.target.value),
+                                      ),
+                                    ),
+                                  }))
+                                }
+                              />
+                              <button
+                                type="button"
+                                aria-label={`Increase ${material.title ?? material.author_editor}`}
+                                onClick={() =>
+                                  setQuantities((current) => ({
+                                    ...current,
+                                    [material.id]: Math.min(
+                                      maxQuantity,
+                                      quantity + 1,
+                                    ),
+                                  }))
+                                }
+                              >
+                                +
+                              </button>
+                            </div>
+                            <small>
+                              {available} {available === 1 ? "copy" : "copies"}{" "}
+                              remaining · {material.visitor_limit} per visitor
+                            </small>
+                          </>
+                        )}
                       </div>
                     </article>
                   );
@@ -504,10 +907,95 @@ function VisitorView({ sessionId }: { sessionId: string }) {
               aria-busy={isSubmitting}
               aria-disabled={isSubmitting || !canSubmit}
             >
-              {isSubmitting ? "Sending request…" : "Send material request"}
+              {isSubmitting ? "Sending request…" : "Proceed"}
             </button>
           </div>
         </form>
+      )}
+      {showSocialChecklist && needsSocialChecklist && (
+        <Modal
+          eyebrow="Tote bag requirement"
+          title="Like, follow, and subscribe"
+          onClose={closeSocialChecklist}
+        >
+          <p>
+            To receive a tote bag, open and like/follow or subscribe to each
+            required NFRDI page using the buttons below. Each step will be
+            crossed out after its page opens. X is optional.
+          </p>
+          <div className="social-checklist">
+            {SOCIAL_LINKS.map((item, index) => {
+              const completed = socialChecks[item.id] === true;
+              const previous = SOCIAL_LINKS[index - 1];
+              const locked = Boolean(previous && !socialChecks[previous.id]);
+              const pending = pendingSocialId === item.id;
+              return (
+                <div
+                  className={`social-checklist-item ${completed ? "completed" : ""}`}
+                  key={item.id}
+                >
+                  <div className="social-step-copy">
+                    <strong>
+                      {item.label}
+                      {item.required ? " · Required" : " · Optional"}
+                    </strong>
+                    <small>{item.action}</small>
+                  </div>
+                  <button
+                    className={`button ghost social-step-button ${completed ? "done" : ""}`}
+                    type="button"
+                    disabled={
+                      completed || locked || pending || pendingSocialId !== null
+                    }
+                    onClick={() => {
+                      if (pendingSocialId !== null || completed || locked)
+                        return;
+                      window.open(item.url, "_blank", "noopener,noreferrer");
+                      setPendingSocialId(item.id);
+                      window.setTimeout(() => {
+                        setSocialChecks((current) => ({
+                          ...current,
+                          [item.id]: true,
+                        }));
+                        setPendingSocialId(null);
+                      }, 1400);
+                    }}
+                  >
+                    {completed ? (
+                      <s>{item.action} · Done</s>
+                    ) : pending ? (
+                      "Opening page…"
+                    ) : (
+                      `Open page ↗`
+                    )}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          {error && (
+            <p className="form-error" role="alert">
+              {error}
+            </p>
+          )}
+          <div className="button-row">
+            <button
+              className="button ghost"
+              type="button"
+              onClick={closeSocialChecklist}
+            >
+              Back
+            </button>
+            <button
+              className="button primary"
+              type="button"
+              disabled={!requiredSocialsComplete || isSubmitting}
+              onClick={() => void sendDistribution()}
+            >
+              {isSubmitting ? "Sending request…" : "Submit request"}
+            </button>
+          </div>
+        </Modal>
       )}
     </main>
   );
@@ -776,31 +1264,41 @@ function AdminView() {
   );
 }
 
+type ProfilePoint = { label: string; visits: number };
+type DashboardVisitorProfile = {
+  visits: number;
+  sex: ProfilePoint[];
+  ageRange: ProfilePoint[];
+  sector: ProfilePoint[];
+  purpose: ProfilePoint[];
+  location: ProfilePoint[];
+};
+type DashboardScope = {
+  copies: number;
+  patrons: number;
+  male: number;
+  female: number;
+  malePercentage: number;
+  femalePercentage: number;
+  transactions: number;
+  distinctMaterials: number;
+  averageCopiesPerPatron: number;
+};
+type StockItem = {
+  id: string;
+  name: string;
+  brought: number;
+  distributed: number;
+  remaining: number;
+};
+
 type DashboardSummary = {
-  overall: {
-    copies: number;
-    patrons: number;
-    male: number;
-    female: number;
-    malePercentage: number;
-    femalePercentage: number;
-    transactions: number;
-    distinctMaterials: number;
-    averageCopiesPerPatron: number;
-    sessions: number;
+  overall: DashboardScope & { sessions: number };
+  exhibit: (DashboardScope & { session: Session }) | null;
+  profiles: {
+    overall: DashboardVisitorProfile;
+    exhibit: DashboardVisitorProfile | null;
   };
-  exhibit: {
-    copies: number;
-    patrons: number;
-    male: number;
-    female: number;
-    malePercentage: number;
-    femalePercentage: number;
-    transactions: number;
-    distinctMaterials: number;
-    averageCopiesPerPatron: number;
-    session: Session;
-  } | null;
   trend: Array<{ date: string; copies: number }>;
   materials: Array<{ name: string; imagePath: string | null; copies: number }>;
   staff: Array<{ name: string; transactions: number; copies: number }>;
@@ -823,15 +1321,778 @@ type DashboardSummary = {
   latestSessionActivity: string | null;
 };
 
+const countFormat = new Intl.NumberFormat("en-PH");
+const formatCount = (value: number) => countFormat.format(value);
+
+function formatShare(value: number, total: number): string {
+  if (total <= 0 || value <= 0) return "0%";
+  const share = (value / total) * 100;
+  return share < 1 ? "<1%" : `${Math.round(share)}%`;
+}
+
+function plural(count: number, one: string, many: string): string {
+  return `${formatCount(count)} ${count === 1 ? one : many}`;
+}
+
+function formatDate(date: string): string {
+  return new Date(`${date}T00:00:00`).toLocaleDateString("en-PH", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+function formatDayLabel(date: string): string {
+  return new Date(`${date}T00:00:00`).toLocaleDateString("en-PH", {
+    month: "short",
+    day: "numeric",
+  });
+}
+
+/** Picks a round axis maximum and up to three gridlines. */
+function niceScale(maxValue: number): { max: number; ticks: number[] } {
+  if (maxValue <= 0) return { max: 1, ticks: [1] };
+  const raw = maxValue / 3;
+  const magnitude = 10 ** Math.floor(Math.log10(raw));
+  const normalized = raw / magnitude;
+  const step =
+    (normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10) *
+    magnitude;
+  const max = Math.ceil(maxValue / step) * step;
+  const ticks: number[] = [];
+  for (let value = step; value <= max + step / 2; value += step)
+    ticks.push(value);
+  return { max, ticks };
+}
+
+function DashSection({
+  title,
+  note,
+  children,
+}: {
+  title: string;
+  note?: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="dash-section">
+      <header className="dash-section-head">
+        <h2>{title}</h2>
+        {note && <p>{note}</p>}
+      </header>
+      {children}
+    </section>
+  );
+}
+
+function Panel({
+  title,
+  sub,
+  span,
+  children,
+}: {
+  title: string;
+  sub?: string;
+  span: 4 | 5 | 6 | 7 | 8 | 12;
+  children: ReactNode;
+}) {
+  return (
+    <article className={`dash-panel span-${span}`}>
+      <header>
+        <h3>{title}</h3>
+        {sub && <p>{sub}</p>}
+      </header>
+      <div className="dash-panel-body">{children}</div>
+    </article>
+  );
+}
+
+function EmptyPanel({ children }: { children: ReactNode }) {
+  return <div className="dash-empty">{children}</div>;
+}
+
+function Kpi({
+  label,
+  value,
+  foot,
+  hero = false,
+}: {
+  label: string;
+  value: string;
+  foot: string;
+  hero?: boolean;
+}) {
+  return (
+    <div className={`dash-kpi ${hero ? "is-hero" : ""}`}>
+      <p className="eyebrow">{label}</p>
+      <strong>{value}</strong>
+      <small>{foot}</small>
+    </div>
+  );
+}
+
+/* ---------- Pie chart ---------------------------------------------------------------- */
+
+type PieSlice = {
+  label: string;
+  visits: number;
+  fill: string;
+  share: number;
+  start: number;
+  end: number;
+};
+
+const PIE_FILL_COUNT = 6;
+
+function pieFill(index: number, patternId: string): string {
+  switch (index) {
+    case 0:
+      return "var(--blue)";
+    case 1:
+      return "var(--accent)";
+    case 2:
+      return `url(#${patternId}-hatch)`;
+    case 3:
+      return `url(#${patternId}-dots)`;
+    case 4:
+      return `url(#${patternId}-stripe)`;
+    default:
+      return "var(--cream)";
+  }
+}
+
+function buildSlices(
+  categories: ProfilePoint[],
+  patternId: string,
+  fixedColors: Record<string, number>,
+): PieSlice[] {
+  const positive = categories.filter((item) => item.visits > 0);
+  const missing = positive.find((item) => item.label === "Not recorded");
+  const named = positive
+    .filter((item) => item.label !== "Not recorded")
+    .sort((left, right) => right.visits - left.visits);
+
+  const maxNamed = PIE_FILL_COUNT - 1 - (missing ? 1 : 0);
+  const kept = named.slice(0, maxNamed);
+  const rest = named.slice(maxNamed);
+  const entries: Array<{ label: string; visits: number; fill: string }> = [];
+
+  const used = new Set(Object.values(fixedColors));
+  let cursor = 0;
+  const nextColor = () => {
+    while (used.has(cursor) && cursor < PIE_FILL_COUNT) cursor += 1;
+    const index = Math.min(cursor, PIE_FILL_COUNT - 1);
+    used.add(index);
+    return index;
+  };
+
+  for (const item of kept) {
+    const index = fixedColors[item.label] ?? nextColor();
+    entries.push({ ...item, fill: pieFill(index, patternId) });
+  }
+  if (rest.length > 0) {
+    entries.push({
+      label: `Other (${rest.length})`,
+      visits: rest.reduce((sum, item) => sum + item.visits, 0),
+      fill: pieFill(5, patternId),
+    });
+  }
+  if (missing) {
+    entries.push({
+      label: missing.label,
+      visits: missing.visits,
+      fill: `url(#${patternId}-grid)`,
+    });
+  }
+
+  const sum = entries.reduce((total, item) => total + item.visits, 0);
+  let angle = -Math.PI / 2;
+  return entries.map((item) => {
+    const share = sum > 0 ? item.visits / sum : 0;
+    const start = angle;
+    angle += share * Math.PI * 2;
+    return { ...item, share, start, end: angle };
+  });
+}
+
+function arcPath(
+  cx: number,
+  cy: number,
+  r: number,
+  start: number,
+  end: number,
+) {
+  const x0 = cx + r * Math.cos(start);
+  const y0 = cy + r * Math.sin(start);
+  const x1 = cx + r * Math.cos(end);
+  const y1 = cy + r * Math.sin(end);
+  const large = end - start > Math.PI ? 1 : 0;
+  return `M ${cx} ${cy} L ${x0.toFixed(2)} ${y0.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x1.toFixed(2)} ${y1.toFixed(2)} Z`;
+}
+
+function PieChart({
+  name,
+  categories,
+  fixedColors = {},
+}: {
+  name: string;
+  categories: ProfilePoint[];
+  fixedColors?: Record<string, number>;
+}) {
+  const patternId = `pie-${useId().replace(/:/g, "")}`;
+  const slices = buildSlices(categories, patternId, fixedColors);
+  const total = slices.reduce((sum, slice) => sum + slice.visits, 0);
+
+  if (total === 0)
+    return <EmptyPanel>No {name.toLowerCase()} data yet</EmptyPanel>;
+
+  const size = 200;
+  const center = size / 2;
+  const radius = 92;
+  const summary = slices
+    .map(
+      (slice) =>
+        `${slice.label} ${slice.visits} (${formatShare(slice.visits, total)})`,
+    )
+    .join(", ");
+
+  return (
+    <div className="dash-pie">
+      <svg
+        className="dash-pie-svg"
+        viewBox={`0 0 ${size} ${size}`}
+        role="img"
+        aria-label={`${name}: ${summary}`}
+      >
+        <defs>
+          <pattern
+            id={`${patternId}-hatch`}
+            width="9"
+            height="9"
+            patternUnits="userSpaceOnUse"
+            patternTransform="rotate(45)"
+          >
+            <rect width="9" height="9" style={{ fill: "var(--cream)" }} />
+            <rect width="3.5" height="9" style={{ fill: "var(--blue)" }} />
+          </pattern>
+          <pattern
+            id={`${patternId}-dots`}
+            width="9"
+            height="9"
+            patternUnits="userSpaceOnUse"
+          >
+            <rect width="9" height="9" style={{ fill: "var(--accent)" }} />
+            <circle cx="4.5" cy="4.5" r="1.8" style={{ fill: "var(--blue)" }} />
+          </pattern>
+          <pattern
+            id={`${patternId}-stripe`}
+            width="9"
+            height="9"
+            patternUnits="userSpaceOnUse"
+            patternTransform="rotate(-45)"
+          >
+            <rect width="9" height="9" style={{ fill: "var(--cream)" }} />
+            <rect width="3.5" height="9" style={{ fill: "var(--accent)" }} />
+          </pattern>
+          <pattern
+            id={`${patternId}-grid`}
+            width="8"
+            height="8"
+            patternUnits="userSpaceOnUse"
+          >
+            <rect width="8" height="8" style={{ fill: "var(--cream)" }} />
+            <path
+              d="M0 0H8M0 0V8"
+              style={{
+                stroke: "var(--blue-muted)",
+                strokeWidth: 1.5,
+                fill: "none",
+              }}
+            />
+          </pattern>
+        </defs>
+        {slices.length === 1 ? (
+          <circle
+            cx={center}
+            cy={center}
+            r={radius}
+            style={{
+              fill: slices[0].fill,
+              stroke: "var(--ink)",
+              strokeWidth: 3,
+            }}
+          />
+        ) : (
+          slices.map((slice) => (
+            <path
+              key={slice.label}
+              d={arcPath(center, center, radius, slice.start, slice.end)}
+              style={{
+                fill: slice.fill,
+                stroke: "var(--ink)",
+                strokeWidth: 3,
+                strokeLinejoin: "miter",
+              }}
+            />
+          ))
+        )}
+        {slices
+          .filter((slice) => slice.share >= 0.1)
+          .map((slice) => {
+            const middle = (slice.start + slice.end) / 2;
+            const distance = slices.length === 1 ? 0 : radius * 0.62;
+            const x = center + distance * Math.cos(middle);
+            const y = center + distance * Math.sin(middle);
+            return (
+              <g key={`chip-${slice.label}`} aria-hidden="true">
+                <rect
+                  x={x - 23}
+                  y={y - 12}
+                  width="46"
+                  height="24"
+                  style={{
+                    fill: "var(--cream)",
+                    stroke: "var(--ink)",
+                    strokeWidth: 2,
+                  }}
+                />
+                <text
+                  x={x}
+                  y={y}
+                  textAnchor="middle"
+                  dominantBaseline="central"
+                  style={{
+                    fill: "var(--ink)",
+                    fontFamily: "var(--font-sans)",
+                    fontSize: 13,
+                    fontWeight: 800,
+                  }}
+                >
+                  {Math.round(slice.share * 100)}%
+                </text>
+              </g>
+            );
+          })}
+      </svg>
+      <ul className="dash-legend">
+        {slices.map((slice) => (
+          <li key={slice.label}>
+            <svg className="dash-swatch" viewBox="0 0 22 22" aria-hidden="true">
+              <rect
+                x="1"
+                y="1"
+                width="20"
+                height="20"
+                style={{
+                  fill: slice.fill,
+                  stroke: "var(--ink)",
+                  strokeWidth: 2,
+                }}
+              />
+            </svg>
+            <span title={slice.label}>{slice.label}</span>
+            <b>{formatCount(slice.visits)}</b>
+            <small>{formatShare(slice.visits, total)}</small>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/* ---------- Horizontal bar list ------------------------------------------------------ */
+
+type BarItem = {
+  key: string;
+  label: string;
+  value: number;
+  aside?: string;
+  note?: string;
+  imagePath?: string | null;
+  lead?: boolean;
+  muted?: boolean;
+};
+
+function BarList({
+  items,
+  thumbnails = false,
+}: {
+  items: BarItem[];
+  thumbnails?: boolean;
+}) {
+  const max = Math.max(1, ...items.map((item) => item.value));
+  const allTied = items.length > 1 && items.every((item) => item.value === max);
+  return (
+    <ul className={`dash-bars ${thumbnails ? "has-thumbs" : ""}`}>
+      {items.map((item) => (
+        <li
+          key={item.key}
+          className={`${(item.lead ?? (!allTied && !item.muted && item.value === max)) ? "is-lead" : ""} ${item.muted ? "is-muted" : ""}`}
+        >
+          {thumbnails &&
+            (item.imagePath ? (
+              <img
+                className="dash-thumb"
+                src={`/uploads/${encodeURIComponent(item.imagePath)}`}
+                alt=""
+              />
+            ) : (
+              <span className="dash-thumb" aria-hidden="true">
+                IEC
+              </span>
+            ))}
+          <div className="dash-bar-body">
+            <div className="dash-bar-head">
+              <span title={item.label}>{item.label}</span>
+              <b>{formatCount(item.value)}</b>
+              {item.aside && <small>{item.aside}</small>}
+            </div>
+            <span className="dash-track" aria-hidden="true">
+              <i
+                style={{
+                  width: `${item.value > 0 ? Math.max(3, (item.value / max) * 100) : 0}%`,
+                }}
+              />
+            </span>
+            {item.note && <small className="dash-bar-note">{item.note}</small>}
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function profileItems(points: ProfilePoint[], total: number): BarItem[] {
+  return points.map((point) => ({
+    key: point.label,
+    label: point.label,
+    value: point.visits,
+    aside: formatShare(point.visits, total),
+    muted: point.label === "Not recorded",
+  }));
+}
+
+/** Accent for the highest column(s); no emphasis when every column is equal. */
+function peakTone(values: number[], value: number): "ink" | "accent" {
+  const max = Math.max(0, ...values);
+  const allTied = values.length > 1 && values.every((item) => item === max);
+  return max > 0 && value === max && !allTied ? "accent" : "ink";
+}
+
+/* ---------- Column chart ------------------------------------------------------------- */
+
+type Column = {
+  key: string;
+  label: string;
+  title: string;
+  segments: Array<{ value: number; tone: "ink" | "accent" }>;
+};
+
+function ColumnChart({
+  columns,
+  ariaLabel,
+  showValues,
+}: {
+  columns: Column[];
+  ariaLabel: string;
+  showValues: boolean;
+}) {
+  const totals = columns.map((column) =>
+    column.segments.reduce((sum, segment) => sum + segment.value, 0),
+  );
+  const { max, ticks } = niceScale(Math.max(0, ...totals));
+  const labelEvery = Math.max(1, Math.ceil(columns.length / 10));
+
+  return (
+    <div className="dash-cols" role="img" aria-label={ariaLabel}>
+      <div className="dash-cols-axis" aria-hidden="true">
+        {[0, ...ticks].map((tick) => (
+          <span key={tick} style={{ bottom: `${(tick / max) * 100}%` }}>
+            {formatCount(tick)}
+          </span>
+        ))}
+      </div>
+      <div className="dash-cols-plot">
+        <div className="dash-cols-grid" aria-hidden="true">
+          {ticks.map((tick) => (
+            <i key={tick} style={{ bottom: `${(tick / max) * 100}%` }} />
+          ))}
+        </div>
+        {columns.map((column, index) => {
+          const total = totals[index];
+          const height = `max(6px, ${(total / max) * 100}%)`;
+          return (
+            <div className="dash-col" key={column.key} title={column.title}>
+              <div className="dash-col-area">
+                {total > 0 && showValues && (
+                  <b
+                    className="dash-col-value"
+                    style={{ bottom: `calc(${height} + 4px)` }}
+                  >
+                    {formatCount(total)}
+                  </b>
+                )}
+                {total > 0 && (
+                  <div className="dash-stack" style={{ height }}>
+                    {column.segments
+                      .filter((segment) => segment.value > 0)
+                      .map((segment, segmentIndex) => (
+                        <span
+                          key={segmentIndex}
+                          className={`tone-${segment.tone}`}
+                          style={{ flex: `${segment.value} 1 0` }}
+                        />
+                      ))}
+                  </div>
+                )}
+              </div>
+              <small>{index % labelEvery === 0 ? column.label : ""}</small>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Dashboard ---------------------------------------------------------------- */
+
+function KpiRow({
+  scope,
+  stock,
+}: {
+  scope: DashboardScope;
+  stock: StockItem[];
+}) {
+  const brought = stock.reduce((sum, item) => sum + item.brought, 0);
+  const given = stock.reduce(
+    (sum, item) => sum + Math.min(item.distributed, item.brought),
+    0,
+  );
+  const known = scope.male + scope.female > 0;
+  return (
+    <div className="dash-kpis">
+      <Kpi
+        hero
+        label="Copies distributed"
+        value={formatCount(scope.copies)}
+        foot={`${scope.averageCopiesPerPatron.toFixed(1)} per patron`}
+      />
+      <Kpi
+        label="Unique patrons"
+        value={formatCount(scope.patrons)}
+        foot={
+          known
+            ? `${Math.round(scope.femalePercentage)}% female, ${Math.round(scope.malePercentage)}% male`
+            : "No sex recorded"
+        }
+      />
+      <Kpi
+        label="Submissions"
+        value={formatCount(scope.transactions)}
+        foot={`${scope.transactions ? (scope.copies / scope.transactions).toFixed(1) : "0.0"} copies each`}
+      />
+      <Kpi
+        label="Distinct IECs"
+        value={formatCount(scope.distinctMaterials)}
+        foot="Different materials given out"
+      />
+      {brought > 0 && (
+        <Kpi
+          label="Stock given out"
+          value={`${Math.round((given / brought) * 100)}%`}
+          foot={`${formatCount(given)} of ${formatCount(brought)} copies`}
+        />
+      )}
+    </div>
+  );
+}
+
+function StockPanel({ items }: { items: StockItem[] }) {
+  const sorted = [...items].sort(
+    (left, right) =>
+      left.remaining / Math.max(1, left.brought) -
+        right.remaining / Math.max(1, right.brought) ||
+      left.name.localeCompare(right.name),
+  );
+  const brought = items.reduce((sum, item) => sum + item.brought, 0);
+  const given = items.reduce(
+    (sum, item) => sum + Math.min(item.distributed, item.brought),
+    0,
+  );
+  return (
+    <Panel
+      title="Stock left"
+      sub="Closest to running out first. Covers the whole exhibit, not the date range."
+      span={6}
+    >
+      {sorted.length === 0 ? (
+        <EmptyPanel>
+          No stock counts for this exhibit. Set “Stock brought” when you edit
+          the session.
+        </EmptyPanel>
+      ) : (
+        <>
+          <dl className="dash-stats">
+            <div>
+              <dt>Brought</dt>
+              <dd>{formatCount(brought)}</dd>
+            </div>
+            <div>
+              <dt>Given out</dt>
+              <dd>{formatCount(given)}</dd>
+            </div>
+            <div>
+              <dt>Left</dt>
+              <dd>{formatCount(brought - given)}</dd>
+            </div>
+          </dl>
+          <ul className="dash-bars">
+            {sorted.map((item) => {
+              const out = item.brought > 0 && item.remaining === 0;
+              const low =
+                !out &&
+                item.brought > 0 &&
+                item.remaining / item.brought <= 0.1;
+              return (
+                <li key={item.id}>
+                  <div className="dash-bar-body">
+                    <div className="dash-bar-head">
+                      <span title={item.name}>{item.name}</span>
+                      {out && <em className="dash-tag is-out">Sold out</em>}
+                      {low && <em className="dash-tag is-low">Low</em>}
+                      <b>{formatCount(item.remaining)}</b>
+                      <small>left</small>
+                    </div>
+                    <span className="dash-track" aria-hidden="true">
+                      <i
+                        style={{
+                          width: `${item.brought > 0 ? (Math.min(item.distributed, item.brought) / item.brought) * 100 : 0}%`,
+                        }}
+                      />
+                    </span>
+                    <small className="dash-bar-note">
+                      {formatCount(item.distributed)} of{" "}
+                      {formatCount(item.brought)} given out
+                    </small>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function ProfileGrid({ profile }: { profile: DashboardVisitorProfile }) {
+  const ageColumns: Column[] = profile.ageRange.map((item) => ({
+    key: item.label,
+    label: item.label === "Not recorded" ? "Blank" : item.label,
+    title: `${item.label}: ${plural(item.visits, "submission", "submissions")}`,
+    segments: [
+      {
+        value: item.visits,
+        tone: peakTone(
+          profile.ageRange.map((point) => point.visits),
+          item.visits,
+        ),
+      },
+    ],
+  }));
+  return (
+    <div className="dash-grid">
+      <Panel title="Age range" sub="Submissions per age group" span={8}>
+        {profile.visits === 0 ? (
+          <EmptyPanel>No visitor profile data for this view</EmptyPanel>
+        ) : (
+          <ColumnChart
+            columns={ageColumns}
+            showValues
+            ariaLabel={`Submissions by age range. ${profile.ageRange
+              .map((item) => `${item.label}: ${item.visits}`)
+              .join("; ")}`}
+          />
+        )}
+      </Panel>
+      <Panel title="Sex" sub="Share of submissions" span={4}>
+        <PieChart
+          name="Sex"
+          categories={profile.sex}
+          fixedColors={{ Female: 0, Male: 1 }}
+        />
+      </Panel>
+      <Panel title="Sector" sub="Share of submissions" span={4}>
+        <PieChart name="Sector" categories={profile.sector} />
+      </Panel>
+      <Panel title="Home location" sub="City and province, top values" span={4}>
+        {profile.visits === 0 ? (
+          <EmptyPanel>No visitor profile data for this view</EmptyPanel>
+        ) : (
+          <BarList items={profileItems(profile.location, profile.visits)} />
+        )}
+      </Panel>
+      <Panel title="IEC purpose" sub="Optional question, top answers" span={4}>
+        {profile.visits === 0 ? (
+          <EmptyPanel>No visitor profile data for this view</EmptyPanel>
+        ) : (
+          <BarList items={profileItems(profile.purpose, profile.visits)} />
+        )}
+      </Panel>
+    </div>
+  );
+}
+
 function DashboardPanel({ sessions }: { sessions: Session[] }) {
   const [sessionId, setSessionId] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [data, setData] = useState<DashboardSummary | null>(null);
   const [error, setError] = useState("");
+  const [stock, setStock] = useState<{
+    sessionId: string;
+    items: StockItem[];
+  } | null>(null);
   const activeSession = sessions.find((session) => session.status === "active");
   const effectiveSessionId =
     sessionId || activeSession?.id || sessions[0]?.id || "";
+
+  // Stock comes from the existing read-only GET /api/sessions/:id endpoint
+  // (the same numbers the visitor page uses to enforce limits). Failures are
+  // non-fatal: the stock panel just shows its empty state.
+  useEffect(() => {
+    if (!effectiveSessionId) return;
+    let active = true;
+    void api<{ session: Session; materials: Material[] }>(
+      `/api/sessions/${effectiveSessionId}`,
+    )
+      .then((details) => {
+        if (!active) return;
+        const items = details.materials
+          .filter((material) => (material.stock_quantity ?? 0) < 999999)
+          .map((material) => {
+            const brought = material.stock_quantity ?? 0;
+            const distributed = material.distributed_quantity ?? 0;
+            return {
+              id: material.id,
+              name: material.title?.trim() || material.author_editor,
+              brought,
+              distributed,
+              remaining: Math.max(0, brought - distributed),
+            };
+          });
+        setStock({ sessionId: effectiveSessionId, items });
+      })
+      .catch(() => {
+        if (active) setStock({ sessionId: effectiveSessionId, items: [] });
+      });
+    return () => {
+      active = false;
+    };
+  }, [effectiveSessionId]);
+  const stockItems =
+    stock && stock.sessionId === effectiveSessionId ? stock.items : [];
 
   useEffect(() => {
     if (!effectiveSessionId && sessions.length === 0) {
@@ -868,335 +2129,298 @@ function DashboardPanel({ sessions }: { sessions: Session[] }) {
     );
   if (!data) return <div className="empty-state">Loading dashboard…</div>;
 
-  const overall = data.overall;
-  const exhibit = data.exhibit;
-  const maxTrend = Math.max(1, ...data.trend.map((item) => item.copies));
-  const maxMaterial = Math.max(1, ...data.materials.map((item) => item.copies));
-  const maxStaff = Math.max(1, ...data.staff.map((item) => item.copies));
-  const maxSession = Math.max(
-    1,
-    ...data.sessionVolume.map((item) => item.copies),
+  const { overall, exhibit } = data;
+  const hasDates = Boolean(dateFrom || dateTo);
+  const dateText = hasDates
+    ? `${dateFrom ? formatDate(dateFrom) : "Start"} to ${dateTo ? formatDate(dateTo) : "today"}`
+    : "All dates";
+
+  const peakTrend = data.trend.reduce(
+    (peak, item) => (item.copies > peak.copies ? item : peak),
+    { date: "", copies: 0 },
+  );
+  const trendValues = data.trend.map((item) => item.copies);
+  const trendColumns: Column[] = data.trend.map((item) => ({
+    key: item.date,
+    label: formatDayLabel(item.date),
+    title: `${formatDate(item.date)}: ${plural(item.copies, "copy", "copies")}`,
+    segments: [
+      { value: item.copies, tone: peakTone(trendValues, item.copies) },
+    ],
+  }));
+  const rankedStaff = [...data.staff].sort(
+    (left, right) =>
+      right.copies - left.copies || right.transactions - left.transactions,
+  );
+  const rankedSessions = [...data.sessionVolume].sort(
+    (left, right) =>
+      right.copies - left.copies || right.transactions - left.transactions,
   );
 
   return (
-    <div className="dashboard">
-      <section className="dashboard-section">
-        <div className="dashboard-section-heading">
-          <p className="eyebrow">Institution-wide</p>
-          <h2>01 — Overall distribution</h2>
-        </div>
-        <div className="dashboard-grid overall-grid">
-          <Metric label="Physical copies" value={overall.copies} />
-          <Metric label="Patrons served" value={overall.patrons} />
-          <Metric
-            label="Distribution transactions"
-            value={overall.transactions}
+    <div className="dash">
+      <section
+        className="dash-controls dash-controls-dates"
+        aria-label="Dashboard date range"
+      >
+        <p className="dash-controls-label">Explore recorded activity</p>
+        <label>
+          <span>From</span>
+          <input
+            type="date"
+            value={dateFrom}
+            max={dateTo || undefined}
+            onChange={(event) => setDateFrom(event.target.value)}
           />
-          <Metric
-            label="Distinct IEC materials"
-            value={overall.distinctMaterials}
+        </label>
+        <label>
+          <span>To</span>
+          <input
+            type="date"
+            value={dateTo}
+            min={dateFrom || undefined}
+            onChange={(event) => setDateTo(event.target.value)}
           />
-          <Metric label="Exhibit sessions" value={overall.sessions} />
-          <Metric
-            label="Average copies per patron"
-            value={overall.averageCopiesPerPatron.toFixed(1)}
-          />
-        </div>
-        <div className="dashboard-grid sex-grid">
-          <SexMetric
-            label="Male patrons"
-            value={overall.male}
-            percentage={overall.malePercentage}
-          />
-          <SexMetric
-            label="Female patrons"
-            value={overall.female}
-            percentage={overall.femalePercentage}
-          />
-        </div>
+        </label>
+        <button
+          className="text-button"
+          type="button"
+          disabled={!hasDates}
+          onClick={() => {
+            setDateFrom("");
+            setDateTo("");
+          }}
+        >
+          Clear dates
+        </button>
       </section>
 
-      <section className="dashboard-section exhibit-overview">
-        <div className="exhibit-heading">
-          <div>
-            <p className="eyebrow">Exhibit-specific</p>
-            <h2>02 — Selected exhibit</h2>
+      <div className="dash-body">
+        <DashSection
+          title="Institution-wide"
+          note={`${dateText}. Patrons are counted once per name and sex. Exhibit sessions are the full historical count.`}
+        >
+          <div className="dash-kpis">
+            <Kpi
+              hero
+              label="Copies distributed"
+              value={formatCount(overall.copies)}
+              foot={`${overall.averageCopiesPerPatron.toFixed(1)} per patron`}
+            />
+            <Kpi
+              label="Unique patrons"
+              value={formatCount(overall.patrons)}
+              foot={
+                overall.male + overall.female > 0
+                  ? `${Math.round(overall.femalePercentage)}% female, ${Math.round(overall.malePercentage)}% male`
+                  : "No sex recorded"
+              }
+            />
+            <Kpi
+              label="Submissions"
+              value={formatCount(overall.transactions)}
+              foot={`${overall.transactions ? (overall.copies / overall.transactions).toFixed(1) : "0.0"} copies each`}
+            />
+            <Kpi
+              label="Distinct IECs"
+              value={formatCount(overall.distinctMaterials)}
+              foot="Different materials given out"
+            />
+            <Kpi
+              label="Exhibit sessions"
+              value={formatCount(overall.sessions)}
+              foot="All time"
+            />
           </div>
-          <label>
-            <span>Select exhibit</span>
-            <select
-              value={effectiveSessionId}
-              onChange={(event) => setSessionId(event.target.value)}
+          <h3 className="dash-subhead">
+            Who the library reaches
+            <small>
+              Counts {formatCount(data.profiles.overall.visits)} submissions, so
+              repeat visits are included.
+            </small>
+          </h3>
+          <ProfileGrid profile={data.profiles.overall} />
+          <div className="dash-grid">
+            <Panel
+              title="Exhibits compared"
+              sub="Copies given out per exhibit"
+              span={12}
             >
-              {sessions.map((session) => (
-                <option value={session.id} key={session.id}>
-                  {session.name} — {session.status}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="date-range">
-            <label>
-              <span>From</span>
-              <input
-                type="date"
-                value={dateFrom}
-                onChange={(event) => setDateFrom(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>To</span>
-              <input
-                type="date"
-                value={dateTo}
-                onChange={(event) => setDateTo(event.target.value)}
-              />
-            </label>
-            {(dateFrom || dateTo) && (
-              <button
-                className="text-button"
-                type="button"
-                onClick={() => {
-                  setDateFrom("");
-                  setDateTo("");
-                }}
-              >
-                Clear range
-              </button>
-            )}
-          </div>
-        </div>
-        {exhibit && (
-          <>
-            <div className="exhibit-status">
-              <strong>{exhibit.session.name}</strong>
-              <span className={`status-pill ${exhibit.session.status}`}>
-                {exhibit.session.status}
-              </span>
-              {data.latestSessionActivity && (
-                <span>
-                  Latest:{" "}
-                  {new Date(data.latestSessionActivity).toLocaleString()}
-                </span>
+              {rankedSessions.length === 0 ? (
+                <EmptyPanel>No exhibit data</EmptyPanel>
+              ) : (
+                <BarList
+                  items={rankedSessions.map((item) => ({
+                    key: item.id,
+                    label: item.name,
+                    value: item.copies,
+                    note: plural(
+                      item.transactions,
+                      "submission",
+                      "submissions",
+                    ),
+                    lead: item.id === effectiveSessionId ? true : undefined,
+                  }))}
+                />
               )}
-            </div>
-            <div className="dashboard-grid overall-grid exhibit-grid">
-              <Metric label="Physical copies" value={exhibit.copies} />
-              <Metric label="Patrons served" value={exhibit.patrons} />
-              <Metric
-                label="Distribution transactions"
-                value={exhibit.transactions}
-              />
-              <Metric
-                label="Distinct IEC materials"
-                value={exhibit.distinctMaterials}
-              />
-              <Metric
-                label="Average copies per patron"
-                value={exhibit.averageCopiesPerPatron.toFixed(1)}
-              />
-            </div>
-            <div className="dashboard-grid sex-grid">
-              <SexMetric
-                label="Male patrons"
-                value={exhibit.male}
-                percentage={exhibit.malePercentage}
-              />
-              <SexMetric
-                label="Female patrons"
-                value={exhibit.female}
-                percentage={exhibit.femalePercentage}
-              />
-            </div>
-          </>
-        )}
-      </section>
-
-      <section className="dashboard-section analytics-grid">
-        <ChartPanel title="03 — Distribution trend" eyebrow="Daily copies">
-          {data.trend.length === 0 ? (
-            <EmptyChart>No distribution data</EmptyChart>
-          ) : (
-            <div
-              className="trend-chart"
-              role="img"
-              aria-label="Daily physical copies distributed"
-            >
-              {data.trend.map((item) => (
-                <div className="trend-column" key={item.date}>
-                  <span
-                    className="trend-bar"
-                    style={{
-                      height: `${Math.max(8, (item.copies / maxTrend) * 100)}%`,
-                    }}
-                  />
-                  <small>{item.date.slice(5)}</small>
-                </div>
-              ))}
-            </div>
-          )}
-        </ChartPanel>
-
-        <ChartPanel
-          title="04 — Most distributed IEC"
-          eyebrow="Copies distributed"
-        >
-          {data.materials.length === 0 ? (
-            <EmptyChart>No IEC distribution data</EmptyChart>
-          ) : (
-            <div className="rank-list">
-              {data.materials.map((item, index) => (
-                <div className="rank-row" key={`${item.name}-${index}`}>
-                  {item.imagePath ? (
-                    <img
-                      src={`/uploads/${encodeURIComponent(item.imagePath)}`}
-                      alt=""
-                    />
-                  ) : (
-                    <span className="rank-placeholder">IEC</span>
-                  )}
-                  <div>
-                    <strong>{item.name}</strong>
-                    <span className="rank-track">
-                      <span
-                        style={{
-                          width: `${(item.copies / maxMaterial) * 100}%`,
-                        }}
-                      />
-                    </span>
-                  </div>
-                  <b>{item.copies}</b>
-                </div>
-              ))}
-            </div>
-          )}
-        </ChartPanel>
-
-        <ChartPanel
-          title="05 — Distribution by exhibit"
-          eyebrow="Physical copies"
-        >
-          {data.sessionVolume.length === 0 ? (
-            <EmptyChart>No exhibit data</EmptyChart>
-          ) : (
-            <div className="bar-list">
-              {data.sessionVolume.map((item) => (
-                <div className="bar-row" key={item.id}>
-                  <span>{item.name}</span>
-                  <div className="bar-track">
-                    <span
-                      style={{ width: `${(item.copies / maxSession) * 100}%` }}
-                    />
-                  </div>
-                  <b>{item.copies}</b>
-                </div>
-              ))}
-            </div>
-          )}
-        </ChartPanel>
-
-        <ChartPanel
-          title="06 — Distribution by staff"
-          eyebrow="Copies and transactions"
-        >
-          {data.staff.length === 0 ? (
-            <EmptyChart>No staff distribution data</EmptyChart>
-          ) : (
-            <div className="bar-list staff-bars">
-              {data.staff.map((item) => (
-                <div className="bar-row" key={item.name}>
-                  <span>{item.name}</span>
-                  <div className="bar-track">
-                    <span
-                      style={{ width: `${(item.copies / maxStaff) * 100}%` }}
-                    />
-                  </div>
-                  <b>{item.copies}</b>
-                  <small>{item.transactions} transactions</small>
-                </div>
-              ))}
-            </div>
-          )}
-        </ChartPanel>
-      </section>
-
-      <section className="dashboard-section recent-section">
-        <div className="dashboard-section-heading">
-          <p className="eyebrow">Latest submissions</p>
-          <h2>07 — Recent distribution activity</h2>
-        </div>
-        {data.recent.length === 0 ? (
-          <EmptyChart>No distribution activity</EmptyChart>
-        ) : (
-          <div className="recent-table">
-            {data.recent.map((row, index) => (
-              <article key={`${row.id}-${row.iecTitle}-${index}`}>
-                <time>{new Date(row.distributed_at).toLocaleString()}</time>
-                <strong>{row.patronName}</strong>
-                <span>{row.patronSex}</span>
-                <span>{row.iecTitle}</span>
-                <b>× {row.quantity}</b>
-                <span>{row.distributedBy ?? "Unknown"}</span>
-              </article>
-            ))}
+            </Panel>
           </div>
-        )}
-      </section>
-    </div>
-  );
-}
+        </DashSection>
 
-function Metric({ label, value }: { label: string; value: number | string }) {
-  return (
-    <div className="metric">
-      <p className="eyebrow">{label}</p>
-      <strong>{value}</strong>
-    </div>
-  );
-}
+        <DashSection title="Selected exhibit">
+          <section
+            className="dash-controls dash-controls-exhibit"
+            aria-label="Exhibit selection"
+          >
+            <label className="dash-scope-field">
+              <span>Select exhibit</span>
+              <select
+                value={effectiveSessionId}
+                onChange={(event) => setSessionId(event.target.value)}
+              >
+                {sessions.map((session) => (
+                  <option value={session.id} key={session.id}>
+                    {session.name} ({session.status})
+                  </option>
+                ))}
+              </select>
+            </label>
+          </section>
+          {exhibit && (
+            <>
+              <p className="dash-scope">
+                <strong>{exhibit.session.name}</strong>
+                <span className={`status-pill ${exhibit.session.status}`}>
+                  {exhibit.session.status}
+                </span>
+                <span>
+                  Created{" "}
+                  {new Date(exhibit.session.created_at).toLocaleDateString()}
+                </span>
+                {data.latestSessionActivity && (
+                  <span>
+                    Latest submission{" "}
+                    {new Date(data.latestSessionActivity).toLocaleString()}
+                  </span>
+                )}
+              </p>
+              <KpiRow scope={exhibit} stock={stockItems} />
+              {data.profiles.exhibit && (
+                <>
+                  <h3 className="dash-subhead">
+                    Who visited this exhibit
+                    <small>
+                      Counts {formatCount(data.profiles.exhibit.visits)}{" "}
+                      submissions for this exhibit.
+                    </small>
+                  </h3>
+                  <ProfileGrid profile={data.profiles.exhibit} />
+                </>
+              )}
+              <div className="dash-grid">
+                <Panel
+                  title="Distribution trend"
+                  sub={
+                    peakTrend.copies > 0
+                      ? `Daily copies. Peak: ${plural(peakTrend.copies, "copy", "copies")} on ${formatDayLabel(peakTrend.date)}`
+                      : "Daily copies"
+                  }
+                  span={12}
+                >
+                  {trendColumns.length === 0 ? (
+                    <EmptyPanel>No distribution data</EmptyPanel>
+                  ) : (
+                    <ColumnChart
+                      columns={trendColumns}
+                      showValues={trendColumns.length <= 14}
+                      ariaLabel={`Daily physical copies distributed across ${trendColumns.length} dates. Peak: ${peakTrend.copies} copies on ${peakTrend.date}.`}
+                    />
+                  )}
+                </Panel>
+                <StockPanel items={stockItems} />
+                <Panel
+                  title="Most distributed IECs"
+                  sub="Physical copies, top 10"
+                  span={6}
+                >
+                  {data.materials.length === 0 ? (
+                    <EmptyPanel>No IEC distribution data</EmptyPanel>
+                  ) : (
+                    <BarList
+                      thumbnails
+                      items={data.materials.map((item, index) => ({
+                        key: `${item.name}-${index}`,
+                        label: item.name,
+                        value: item.copies,
+                        imagePath: item.imagePath,
+                      }))}
+                    />
+                  )}
+                </Panel>
+                <Panel
+                  title="Distribution by staff"
+                  sub="Copies handed out"
+                  span={12}
+                >
+                  {rankedStaff.length === 0 ? (
+                    <EmptyPanel>No staff distribution data</EmptyPanel>
+                  ) : (
+                    <BarList
+                      items={rankedStaff.map((item) => ({
+                        key: item.name,
+                        label: item.name,
+                        value: item.copies,
+                        note: plural(
+                          item.transactions,
+                          "transaction",
+                          "transactions",
+                        ),
+                      }))}
+                    />
+                  )}
+                </Panel>
+              </div>
+            </>
+          )}
+        </DashSection>
 
-function SexMetric({
-  label,
-  value,
-  percentage,
-}: {
-  label: string;
-  value: number;
-  percentage: number;
-}) {
-  return (
-    <div className="sex-metric">
-      <div>
-        <p className="eyebrow">{label}</p>
-        <strong>{value}</strong>
+        <DashSection title="Recent distribution activity">
+          {data.recent.length === 0 ? (
+            <EmptyPanel>No distribution activity</EmptyPanel>
+          ) : (
+            <div className="dash-table-wrap">
+              <table className="dash-table">
+                <thead>
+                  <tr>
+                    <th scope="col">When</th>
+                    <th scope="col">Patron</th>
+                    <th scope="col">Sex</th>
+                    <th scope="col">IEC</th>
+                    <th scope="col" className="num">
+                      Copies
+                    </th>
+                    <th scope="col">Given by</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.recent.map((row, index) => (
+                    <tr key={`${row.id}-${row.iecTitle}-${index}`}>
+                      <td>{new Date(row.distributed_at).toLocaleString()}</td>
+                      <th scope="row">{row.patronName}</th>
+                      <td>{row.patronSex}</td>
+                      <td>{row.iecTitle}</td>
+                      <td className="num">{row.quantity}</td>
+                      <td>{row.distributedBy ?? "Unknown"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </DashSection>
       </div>
-      <b>{percentage.toFixed(1)}%</b>
     </div>
   );
-}
-
-function ChartPanel({
-  title,
-  eyebrow,
-  children,
-}: {
-  title: string;
-  eyebrow: string;
-  children: ReactNode;
-}) {
-  return (
-    <article className="chart-panel">
-      <header>
-        <p className="eyebrow">{eyebrow}</p>
-        <h3>{title}</h3>
-      </header>
-      {children}
-    </article>
-  );
-}
-
-function EmptyChart({ children }: { children: ReactNode }) {
-  return <div className="empty-chart">{children}</div>;
 }
 
 function SessionsPanel({
@@ -1216,6 +2440,19 @@ function SessionsPanel({
   const [name, setName] = useState("");
   const [details, setDetails] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
+  const [stocks, setStocks] = useState<Record<string, number>>({});
+  const [limits, setLimits] = useState<Record<string, number>>({});
+  const [socialChecklistFlags, setSocialChecklistFlags] = useState<
+    Record<string, boolean>
+  >({});
+  const [editingSession, setEditingSession] = useState<Session | null>(null);
+  const [regions, setRegions] = useState<PHArea[]>([]);
+  const [provinces, setProvinces] = useState<PHArea[]>([]);
+  const [cities, setCities] = useState<PHArea[]>([]);
+  const [locationRegion, setLocationRegion] = useState("");
+  const [locationProvince, setLocationProvince] = useState("");
+  const [locationCity, setLocationCity] = useState("");
+  const [locationDetails, setLocationDetails] = useState("");
   const [distributorId, setDistributorId] = useState("");
   const [qr, setQr] = useState<{
     url: string;
@@ -1226,9 +2463,30 @@ function SessionsPanel({
   const [deleting, setDeleting] = useState<Session | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const [error, setError] = useState("");
-  const closeCreating = useCallback(() => setCreating(false), []);
+  const closeCreating = useCallback(() => {
+    setCreating(false);
+    setEditingSession(null);
+    setName("");
+    setDetails("");
+    setSelected([]);
+    setDistributorId("");
+    setStocks({});
+    setLimits({});
+    setSocialChecklistFlags({});
+    setError("");
+    setLocationRegion("");
+    setLocationProvince("");
+    setLocationCity("");
+    setLocationDetails("");
+  }, []);
   const closeQr = useCallback(() => setQr(null), []);
   const closeDeleting = useCallback(() => setDeleting(null), []);
+
+  useEffect(() => {
+    api<PHArea[]>("/api/locations/regions")
+      .then(setRegions)
+      .catch(() => setError("Could not load Philippine locations"));
+  }, []);
 
   async function createSession(event: FormEvent) {
     event.preventDefault();
@@ -1242,25 +2500,114 @@ function SessionsPanel({
       return;
     }
     try {
-      await api<Session>("/api/sessions", {
-        method: "POST",
-        body: JSON.stringify({
-          name,
-          details,
-          status: "active",
-          materialIds: selected,
-          staffId: distributorId,
-        }),
-      });
+      const materialSettings = selected.map((materialId) => ({
+        materialId,
+        stockQuantity: stocks[materialId] ?? 0,
+        visitorLimit: limits[materialId] ?? 1,
+        requiresSocialChecklist: socialChecklistFlags[materialId] ?? false,
+      }));
+      await api<Session>(
+        editingSession ? `/api/sessions/${editingSession.id}` : "/api/sessions",
+        {
+          method: editingSession ? "PATCH" : "POST",
+          body: JSON.stringify({
+            name,
+            details,
+            status: editingSession?.status ?? "active",
+            materialSettings,
+            staffId: distributorId,
+            locationRegion,
+            locationProvince,
+            locationCity,
+            locationDetails,
+          }),
+        },
+      );
       setCreating(false);
       setName("");
       setDetails("");
       setSelected([]);
       setDistributorId("");
+      setStocks({});
+      setLimits({});
+      setEditingSession(null);
+      setSocialChecklistFlags({});
+      setLocationRegion("");
+      setLocationProvince("");
+      setLocationCity("");
+      setLocationDetails("");
       await refresh();
     } catch (reason) {
       setError(
         reason instanceof Error ? reason.message : "Could not create session",
+      );
+    }
+  }
+
+  async function editSession(session: Session) {
+    try {
+      const detailsResult = await api<{
+        session: Session;
+        materials: Material[];
+      }>(`/api/sessions/${session.id}`);
+      setEditingSession(session);
+      setName(session.name);
+      setDetails(session.details ?? "");
+      setDistributorId(session.distributor_staff_id ?? "");
+      setSelected(detailsResult.materials.map((material) => material.id));
+      setStocks(
+        Object.fromEntries(
+          detailsResult.materials.map((material) => [
+            material.id,
+            material.stock_quantity ?? 0,
+          ]),
+        ),
+      );
+      setLimits(
+        Object.fromEntries(
+          detailsResult.materials.map((material) => [
+            material.id,
+            material.visitor_limit ?? 1,
+          ]),
+        ),
+      );
+      setSocialChecklistFlags(
+        Object.fromEntries(
+          detailsResult.materials.map((material) => [
+            material.id,
+            material.requires_social_checklist === 1,
+          ]),
+        ),
+      );
+      const availableRegions = regions.length
+        ? regions
+        : await api<PHArea[]>("/api/locations/regions");
+      if (!regions.length) setRegions(availableRegions);
+      const regionCode =
+        availableRegions.find((item) => item.name === session.location_region)
+          ?.psgcCode ?? "";
+      const nextProvinces = regionCode
+        ? await api<PHArea[]>(`/api/locations/regions/${regionCode}/provinces`)
+        : [];
+      const provinceCode =
+        nextProvinces.find((item) => item.name === session.location_province)
+          ?.psgcCode ?? "";
+      const nextCities = provinceCode
+        ? await api<PHArea[]>(`/api/locations/provinces/${provinceCode}/cities`)
+        : [];
+      setLocationRegion(regionCode);
+      setProvinces(nextProvinces);
+      setLocationProvince(provinceCode);
+      setCities(nextCities);
+      setLocationCity(
+        nextCities.find((item) => item.name === session.location_city)
+          ?.psgcCode ?? "",
+      );
+      setLocationDetails(session.location_details ?? "");
+      setCreating(true);
+    } catch (reason) {
+      setError(
+        reason instanceof Error ? reason.message : "Could not load session",
       );
     }
   }
@@ -1319,7 +2666,22 @@ function SessionsPanel({
         <button
           className="button primary"
           type="button"
-          onClick={() => setCreating(true)}
+          onClick={() => {
+            setEditingSession(null);
+            setName("");
+            setDetails("");
+            setSelected([]);
+            setDistributorId("");
+            setStocks({});
+            setLimits({});
+            setSocialChecklistFlags({});
+            setError("");
+            setLocationRegion("");
+            setLocationProvince("");
+            setLocationCity("");
+            setLocationDetails("");
+            setCreating(true);
+          }}
         >
           Create session
         </button>
@@ -1332,7 +2694,7 @@ function SessionsPanel({
       {creating && (
         <Modal
           eyebrow="New exhibit"
-          title="Create session"
+          title={editingSession ? "Edit session" : "Create session"}
           size="wide"
           onClose={closeCreating}
         >
@@ -1371,6 +2733,79 @@ function SessionsPanel({
                   ))}
               </select>
             </label>
+            <div className="field-grid session-location-fields">
+              <label>
+                <span>Region</span>
+                <select
+                  value={locationRegion}
+                  onChange={async (event) => {
+                    const code = event.target.value;
+                    setLocationRegion(code);
+                    setLocationProvince("");
+                    setLocationCity("");
+                    setCities([]);
+                    setProvinces(
+                      code
+                        ? await api<PHArea[]>(
+                            `/api/locations/regions/${code}/provinces`,
+                          )
+                        : [],
+                    );
+                  }}
+                  required
+                >
+                  <option value="">Select region</option>
+                  {regions.map((item) => (
+                    <option key={item.psgcCode} value={item.psgcCode}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>Province</span>
+                <select
+                  value={locationProvince}
+                  onChange={async (event) => {
+                    const code = event.target.value;
+                    setLocationProvince(code);
+                    setLocationCity("");
+                    setCities(
+                      code
+                        ? await api<PHArea[]>(
+                            `/api/locations/provinces/${code}/cities`,
+                          )
+                        : [],
+                    );
+                  }}
+                  required
+                  disabled={!locationRegion}
+                >
+                  <option value="">Select province</option>
+                  {provinces.map((item) => (
+                    <option key={item.psgcCode} value={item.psgcCode}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>City</span>
+                <select
+                  value={locationCity}
+                  onChange={(event) => setLocationCity(event.target.value)}
+                  required
+                  disabled={!locationProvince}
+                >
+                  <option value="">Select city</option>
+                  {cities.map((item) => (
+                    <option key={item.psgcCode} value={item.psgcCode}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
             <fieldset className="catalog-checklist">
               <legend>
                 IEC materials brought and made available ({selected.length}{" "}
@@ -1379,26 +2814,85 @@ function SessionsPanel({
               {materials
                 .filter((material) => material.active === 1)
                 .map((material) => (
-                  <label
-                    className={selected.includes(material.id) ? "selected" : ""}
+                  <div
+                    className={`catalog-material ${selected.includes(material.id) ? "selected" : ""}`}
                     key={material.id}
                   >
-                    <input
-                      type="checkbox"
-                      checked={selected.includes(material.id)}
-                      onChange={(event) =>
-                        setSelected((current) =>
-                          event.target.checked
-                            ? [...current, material.id]
-                            : current.filter((id) => id !== material.id),
-                        )
-                      }
-                    />
-                    <span>
-                      {material.title || material.author_editor}
-                      <small>Author / Editor: {material.author_editor}</small>
-                    </span>
-                  </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={selected.includes(material.id)}
+                        onChange={(event) =>
+                          setSelected((current) =>
+                            event.target.checked
+                              ? [...current, material.id]
+                              : current.filter((id) => id !== material.id),
+                          )
+                        }
+                      />
+                      <span>
+                        {material.title || material.author_editor}
+                        <small>Author / Editor: {material.author_editor}</small>
+                      </span>
+                    </label>
+                    {selected.includes(material.id) && (
+                      <div className="session-material-settings">
+                        <label className="session-setting-field">
+                          <span>Stock brought</span>
+                          <input
+                            aria-label={`Stock brought: ${material.title || material.author_editor}`}
+                            type="number"
+                            min="0"
+                            max="999999"
+                            value={stocks[material.id] ?? 0}
+                            onChange={(event) =>
+                              setStocks((current) => ({
+                                ...current,
+                                [material.id]: Math.max(
+                                  0,
+                                  Number(event.target.value),
+                                ),
+                              }))
+                            }
+                            required
+                          />
+                        </label>
+                        <label className="session-setting-field">
+                          <span>Limit per visitor</span>
+                          <input
+                            aria-label={`Limit per visitor: ${material.title || material.author_editor}`}
+                            type="number"
+                            min="1"
+                            max="999"
+                            value={limits[material.id] ?? 1}
+                            onChange={(event) =>
+                              setLimits((current) => ({
+                                ...current,
+                                [material.id]: Math.max(
+                                  1,
+                                  Number(event.target.value),
+                                ),
+                              }))
+                            }
+                            required
+                          />
+                        </label>
+                        <label className="tote-bag-toggle">
+                          <input
+                            type="checkbox"
+                            checked={socialChecklistFlags[material.id] ?? false}
+                            onChange={(event) =>
+                              setSocialChecklistFlags((current) => ({
+                                ...current,
+                                [material.id]: event.target.checked,
+                              }))
+                            }
+                          />
+                          <span>Require social checklist</span>
+                        </label>
+                      </div>
+                    )}
+                  </div>
                 ))}
               {materials.filter((material) => material.active === 1).length ===
                 0 && (
@@ -1407,17 +2901,27 @@ function SessionsPanel({
                 </p>
               )}
             </fieldset>
+            <label className="session-location-details">
+              <span>Specific building / location</span>
+              <input
+                value={locationDetails}
+                onChange={(event) => setLocationDetails(event.target.value)}
+                maxLength={150}
+                placeholder="Building, room, or venue"
+                required
+              />
+            </label>
             {error && <p className="form-error">{error}</p>}
             <div className="button-row">
               <button
                 className="button ghost"
                 type="button"
-                onClick={() => setCreating(false)}
+                onClick={closeCreating}
               >
                 Cancel
               </button>
               <button className="button primary" type="submit">
-                Create session
+                {editingSession ? "Save changes" : "Create session"}
               </button>
             </div>
           </form>
@@ -1442,6 +2946,13 @@ function SessionsPanel({
               </div>
             </div>
             <div className="button-row">
+              <button
+                className="button ghost"
+                type="button"
+                onClick={() => void editSession(session)}
+              >
+                Edit
+              </button>
               <button
                 className="button ghost"
                 type="button"

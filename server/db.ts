@@ -17,6 +17,10 @@ db.exec(`
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     details TEXT,
+    location_region TEXT,
+    location_province TEXT,
+    location_city TEXT,
+    location_details TEXT,
     status TEXT NOT NULL DEFAULT 'active'
       CHECK (status IN ('active', 'completed')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -46,6 +50,7 @@ db.exec(`
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     material_id TEXT NOT NULL REFERENCES materials(id) ON DELETE RESTRICT,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    requires_social_checklist INTEGER NOT NULL DEFAULT 0 CHECK (requires_social_checklist IN (0, 1)),
     PRIMARY KEY (session_id, material_id)
   );
 
@@ -53,6 +58,13 @@ db.exec(`
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     sex TEXT NOT NULL,
+    age_range TEXT,
+    region TEXT,
+    province TEXT,
+    city TEXT,
+    sector TEXT,
+    purpose TEXT,
+    privacy_notice_accepted_at TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
   );
 
@@ -110,4 +122,27 @@ if (!entryColumns.some((column) => column.name === 'material_title_snapshot')) {
 const sessionColumns = db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>
 if (!sessionColumns.some((column) => column.name === 'distributor_staff_id')) {
   db.exec('ALTER TABLE sessions ADD COLUMN distributor_staff_id TEXT REFERENCES staff(id) ON DELETE RESTRICT')
+}
+for (const [name, type] of [['location_region', 'TEXT'], ['location_province', 'TEXT'], ['location_city', 'TEXT'], ['location_details', 'TEXT']] as const) {
+  if (!sessionColumns.some((column) => column.name === name)) {
+    db.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${type}`)
+  }
+}
+
+const sessionMaterialColumns = db.prepare('PRAGMA table_info(session_materials)').all() as Array<{ name: string }>
+if (!sessionMaterialColumns.some((column) => column.name === 'stock_quantity')) {
+  db.exec('ALTER TABLE session_materials ADD COLUMN stock_quantity INTEGER NOT NULL DEFAULT 999999')
+}
+
+const patronColumns = db.prepare('PRAGMA table_info(patrons)').all() as Array<{ name: string }>
+for (const [name, type] of [['age_range', 'TEXT'], ['region', 'TEXT'], ['province', 'TEXT'], ['city', 'TEXT'], ['sector', 'TEXT'], ['purpose', 'TEXT'], ['privacy_notice_accepted_at', 'TEXT']] as const) {
+  if (!patronColumns.some((column) => column.name === name)) {
+    db.exec(`ALTER TABLE patrons ADD COLUMN ${name} ${type}`)
+  }
+}
+if (!sessionMaterialColumns.some((column) => column.name === 'visitor_limit')) {
+  db.exec('ALTER TABLE session_materials ADD COLUMN visitor_limit INTEGER NOT NULL DEFAULT 999')
+}
+if (!sessionMaterialColumns.some((column) => column.name === 'requires_social_checklist')) {
+  db.exec('ALTER TABLE session_materials ADD COLUMN requires_social_checklist INTEGER NOT NULL DEFAULT 0')
 }

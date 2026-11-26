@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto'
 import QRCode from 'qrcode'
 import sharp from 'sharp'
 import { z } from 'zod'
+import { getAllRegions, getProvincesByRegion, getMunicipalitiesByProvince, getAllMunicipalities } from '@aivangogh/ph-address'
 import { db } from './db.js'
 import {
   getCloudflareTunnelStatus,
@@ -37,7 +38,12 @@ const sessionSchema = z.object({
   details: z.string().trim().max(2000).optional(),
   status: z.enum(['active', 'completed']).optional(),
   materialIds: z.array(z.string()).optional(),
+  materialSettings: z.array(z.object({ materialId: z.string().min(1), stockQuantity: z.number().int().min(0).max(999999), visitorLimit: z.number().int().min(1).max(999), requiresSocialChecklist: z.boolean().optional() })).optional(),
   staffId: z.string().min(1).optional(),
+  locationRegion: z.string().min(1).max(20).optional(),
+  locationProvince: z.string().min(1).max(20).optional(),
+  locationCity: z.string().min(1).max(20).optional(),
+  locationDetails: z.string().trim().min(1).max(150).optional(),
 })
 
 const staffSchema = z.object({
@@ -53,12 +59,19 @@ const materialSchema = z.object({
 })
 
 const submissionSchema = z.object({
-  name: z.string().trim().min(1).max(200),
+  name: z.string().trim().min(3).max(200).regex(/^[^,]+,\s*[^,]+(?:\s+[^,]+)*$/, 'Enter your name as Surname, First name (for example, Dela Cruz, Juan).'),
   sex: z.enum(['Female', 'Male']),
+  ageRange: z.enum(['0–12', '13–17', '18–24', '25–34', '35–44', '45–54', '55–64', '65+']).optional(),
+  region: z.string().trim().min(1).max(20).optional(),
+  province: z.string().trim().min(1).max(20).optional(),
+  city: z.string().trim().min(1).max(20).optional(),
+  sector: z.enum(['Government', 'Private', 'Academe', 'Independent']).optional(),
+  purpose: z.string().trim().max(200).optional(),
+  privacyAccepted: z.literal(true).optional(),
   entries: z.array(z.object({
     materialId: z.string().min(1),
     quantity: z.number().int().min(1).max(999),
-  })).min(1),
+  })).min(1).refine((entries) => new Set(entries.map((entry) => entry.materialId)).size === entries.length, 'Each IEC can appear only once in a request.'),
 })
 
   function normalizePersonName(value: string): string {
@@ -73,6 +86,13 @@ const submissionSchema = z.object({
 
 function sendError(response: Response, status: number, message: string) {
   response.status(status).json({ error: message })
+}
+
+function invertPersonName(value: string): string {
+  const trimmed = value.trim().replace(/\s+/g, ' ')
+  if (trimmed.includes(',')) return trimmed
+  const parts = trimmed.split(' ')
+  return parts.length > 1 ? `${parts.at(-1)}, ${parts.slice(0, -1).join(' ')}` : trimmed
 }
 
 function parseBody<T>(schema: z.ZodType<T>, request: Request, response: Response): T | null {
@@ -94,6 +114,20 @@ function audit(entityType: string, entityId: string, action: string, changes: un
 function routeParam(request: Request, name: 'id' | 'sessionId'): string {
   const value = request.params[name]
   return Array.isArray(value) ? value[0] : value
+}
+
+function resolveLocation(regionCode: string, provinceCode: string, cityCode: string) {
+  const region = getAllRegions().find((item) => item.psgcCode === regionCode)
+  const metroManilaGroup = regionCode === '1300000000' && provinceCode === '1300000000'
+  const manila = regionCode === '1300000000' && provinceCode === '1380600000'
+  const province = metroManilaGroup ? { name: 'Metro Manila Cities', psgcCode: provinceCode, regionCode }
+    : manila ? { name: 'Manila', psgcCode: provinceCode, regionCode }
+      : getProvincesByRegion(regionCode).find((item) => item.psgcCode === provinceCode)
+  const city = (metroManilaGroup
+    ? getAllMunicipalities().filter((item) => item.provinceCode === regionCode)
+    : getMunicipalitiesByProvince(provinceCode)).find((item) => item.psgcCode === cityCode)
+  if (!region || !province || !city || province.regionCode !== region.psgcCode || (!metroManilaGroup && city.provinceCode !== province.psgcCode)) return null
+  return { region: region.name, province: province.name, city: city.name }
 }
 
 const tunnelStartSchema = z.object({
@@ -129,6 +163,20 @@ apiRouter.get('/health', (_request, response) => {
   response.json({ status: 'ok', database: result.ok === 1 ? 'connected' : 'error' })
 })
 
+apiRouter.get('/locations/regions', (_request, response) => response.json(getAllRegions()))
+apiRouter.get('/locations/regions/:regionCode/provinces', (request, response) => {
+  const provinces = getProvincesByRegion(request.params.regionCode)
+  if (request.params.regionCode === '1300000000') {
+    response.json([
+      { name: 'Metro Manila Cities', psgcCode: '1300000000' },
+      { name: 'Manila', psgcCode: '1380600000' },
+    ])
+    return
+  }
+  response.json(provinces)
+})
+apiRouter.get('/locations/provinces/:provinceCode/cities', (request, response) => response.json(getMunicipalitiesByProvince(request.params.provinceCode)))
+
 apiRouter.get('/tunnel/status', (_request, response) => {
   response.json(getCloudflareTunnelStatus())
 })
@@ -162,6 +210,15 @@ apiRouter.get('/sessions', (_request, response) => {
 apiRouter.post('/sessions', (request, response) => {
   const body = parseBody(sessionSchema, request, response)
   if (!body) return
+  if (!body.locationRegion || !body.locationProvince || !body.locationCity || !body.locationDetails) {
+    sendError(response, 400, 'Complete the session Region, Province, City, and specific building or location')
+    return
+  }
+  const sessionLocation = resolveLocation(body.locationRegion, body.locationProvince, body.locationCity)
+  if (!sessionLocation) {
+    sendError(response, 400, 'Select a valid session Region, Province, and City')
+    return
+  }
   if (!body.staffId) {
     sendError(response, 400, 'Select one distributor for the session')
     return
@@ -180,15 +237,16 @@ apiRouter.post('/sessions', (request, response) => {
         .run()
     }
     db.prepare(`
-      INSERT INTO sessions (id, name, details, status, distributor_staff_id)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(id, body.name, body.details ?? null, body.status ?? 'active', distributor.id)
-    if (body.materialIds) {
+      INSERT INTO sessions (id, name, details, status, distributor_staff_id, location_region, location_province, location_city, location_details)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, body.name, body.details ?? null, body.status ?? 'active', distributor.id, sessionLocation.region, sessionLocation.province, sessionLocation.city, body.locationDetails ?? null)
+    const materialSettings = body.materialSettings ?? body.materialIds?.map((materialId) => ({ materialId, stockQuantity: 0, visitorLimit: 1, requiresSocialChecklist: false }))
+    if (materialSettings) {
       const assign = db.prepare(`
-        INSERT INTO session_materials (session_id, material_id, enabled)
-        VALUES (?, ?, 1)
+        INSERT INTO session_materials (session_id, material_id, enabled, stock_quantity, visitor_limit, requires_social_checklist)
+        VALUES (?, ?, 1, ?, ?, ?)
       `)
-      for (const materialId of body.materialIds) assign.run(id, materialId)
+      for (const material of materialSettings) assign.run(id, material.materialId, material.stockQuantity, material.visitorLimit, material.requiresSocialChecklist ? 1 : 0)
     }
     audit('session', id, 'created', body)
   })
@@ -199,6 +257,18 @@ apiRouter.post('/sessions', (request, response) => {
 apiRouter.patch('/sessions/:id', (request, response) => {
   const body = parseBody(sessionSchema.partial(), request, response)
   if (!body) return
+  const hasSessionLocation = body.locationRegion !== undefined || body.locationProvince !== undefined || body.locationCity !== undefined
+  if (hasSessionLocation && (!body.locationRegion || !body.locationProvince || !body.locationCity || !body.locationDetails)) {
+    sendError(response, 400, 'Complete the session Region, Province, City, and specific building or location')
+    return
+  }
+  const sessionLocation = hasSessionLocation
+    ? resolveLocation(body.locationRegion!, body.locationProvince!, body.locationCity!)
+    : null
+  if (hasSessionLocation && !sessionLocation) {
+    sendError(response, 400, 'Select a valid session Region, Province, and City')
+    return
+  }
   if (body.staffId) {
     const distributor = db.prepare('SELECT id, active FROM staff WHERE id = ?').get(body.staffId) as
       | { id: string; active: number }
@@ -224,16 +294,21 @@ apiRouter.patch('/sessions/:id', (request, response) => {
           details = COALESCE(?, details),
           status = COALESCE(?, status),
           distributor_staff_id = COALESCE(?, distributor_staff_id),
+          location_region = COALESCE(?, location_region),
+          location_province = COALESCE(?, location_province),
+          location_city = COALESCE(?, location_city),
+          location_details = COALESCE(?, location_details),
           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
       WHERE id = ?
-    `).run(body.name ?? null, body.details ?? null, body.status ?? null, body.staffId ?? null, request.params.id)
-    if (body.materialIds) {
+    `).run(body.name ?? null, body.details ?? null, body.status ?? null, body.staffId ?? null, sessionLocation?.region ?? null, sessionLocation?.province ?? null, sessionLocation?.city ?? null, body.locationDetails ?? null, request.params.id)
+    const materialSettings = body.materialSettings ?? body.materialIds?.map((materialId) => ({ materialId, stockQuantity: 0, visitorLimit: 1, requiresSocialChecklist: false }))
+    if (materialSettings) {
       db.prepare('DELETE FROM session_materials WHERE session_id = ?').run(request.params.id)
       const assign = db.prepare(`
-        INSERT INTO session_materials (session_id, material_id, enabled)
-        VALUES (?, ?, 1)
+        INSERT INTO session_materials (session_id, material_id, enabled, stock_quantity, visitor_limit, requires_social_checklist)
+        VALUES (?, ?, 1, ?, ?, ?)
       `)
-      for (const materialId of body.materialIds) assign.run(request.params.id, materialId)
+      for (const material of materialSettings) assign.run(request.params.id, material.materialId, material.stockQuantity, material.visitorLimit, material.requiresSocialChecklist ? 1 : 0)
     }
     audit('session', request.params.id, 'updated', body)
   })
@@ -299,6 +374,9 @@ apiRouter.get('/sessions/:id', (request, response) => {
   }
   const materials = db.prepare(`
     SELECT m.*,
+           sm.stock_quantity,
+           sm.visitor_limit,
+           sm.requires_social_checklist,
            COALESCE((
              SELECT SUM(de.quantity)
              FROM distributions d
@@ -484,7 +562,31 @@ apiRouter.patch('/staff/:id', (request, response) => {
 apiRouter.post('/sessions/:sessionId/distributions', (request, response) => {
   const body = parseBody(submissionSchema, request, response)
   if (!body) return
+  if (!body.privacyAccepted) {
+    sendError(response, 400, 'Acknowledge the privacy notice before continuing')
+    return
+  }
   body.name = normalizePersonName(body.name)
+  if (!body.ageRange || !body.region || !body.province || !body.city) {
+    sendError(response, 400, 'Complete your age range and Region, Province, and City')
+    return
+  }
+  const region = getAllRegions().find((item) => item.psgcCode === body.region)
+  const isMetroManilaGroup = body.region === '1300000000' && body.province === '1300000000'
+  const isManila = body.region === '1300000000' && body.province === '1380600000'
+  const province = isMetroManilaGroup ? { name: 'Metro Manila Cities', psgcCode: body.province, regionCode: body.region }
+    : isManila ? { name: 'Manila', psgcCode: body.province, regionCode: body.region }
+      : getProvincesByRegion(body.region).find((item) => item.psgcCode === body.province)
+  const city = (isMetroManilaGroup
+    ? getAllMunicipalities().filter((item) => item.provinceCode === body.region)
+    : getMunicipalitiesByProvince(body.province)).find((item) => item.psgcCode === body.city)
+  if (!region || !province || !city || province.regionCode !== region.psgcCode || (!isMetroManilaGroup && city.provinceCode !== province.psgcCode)) {
+    sendError(response, 400, 'Select a valid Region, Province, and City combination')
+    return
+  }
+  body.region = region.name
+  body.province = province.name
+  body.city = city.name
   const session = db.prepare(`
     SELECT sessions.*, staff.active AS distributor_active
     FROM sessions
@@ -510,8 +612,8 @@ apiRouter.post('/sessions/:sessionId/distributions', (request, response) => {
   const patronId = randomUUID()
   const now = new Date().toISOString()
   const submission = db.transaction(() => {
-    const insertPatron = db.prepare('INSERT INTO patrons (id, name, sex) VALUES (?, ?, ?)')
-    insertPatron.run(patronId, body.name, body.sex)
+    const insertPatron = db.prepare('INSERT INTO patrons (id, name, sex, age_range, region, province, city, sector, purpose, privacy_notice_accepted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    insertPatron.run(patronId, body.name, body.sex, body.ageRange, body.region, body.province, body.city, body.sector ?? null, body.purpose ?? null, new Date().toISOString())
     db.prepare(`
       INSERT INTO distributions (
         id, session_id, patron_id, distributed_at, distributed_by_staff_id
@@ -526,14 +628,17 @@ apiRouter.post('/sessions/:sessionId/distributions', (request, response) => {
     `)
     for (const entry of body.entries) {
       const material = db.prepare(`
-        SELECT m.id, m.author_editor, m.title
+        SELECT m.id, m.author_editor, m.title, sm.stock_quantity, sm.visitor_limit,
+          COALESCE((SELECT SUM(de.quantity) FROM distributions d JOIN distribution_entries de ON de.distribution_id = d.id WHERE d.session_id = sm.session_id AND d.is_voided = 0 AND de.material_id = m.id), 0) AS distributed_quantity
         FROM session_materials sm
         JOIN materials m ON m.id = sm.material_id
         WHERE sm.session_id = ? AND sm.enabled = 1 AND m.active = 1 AND m.id = ?
-      `).get(session.id, entry.materialId) as { id: string; author_editor: string; title: string | null } | undefined
+      `).get(session.id, entry.materialId) as { id: string; author_editor: string; title: string | null; stock_quantity: number; visitor_limit: number; distributed_quantity: number } | undefined
       if (!material) {
         throw new Error('One or more selected materials are unavailable in this session')
       }
+      if (entry.quantity > material.visitor_limit) throw new Error(`Limit is ${material.visitor_limit} per visitor for ${material.title ?? material.author_editor}`)
+      if (material.distributed_quantity + entry.quantity > material.stock_quantity) throw new Error(`${material.title ?? material.author_editor} is out of stock`)
       insertEntry.run(
         randomUUID(),
         distributionId,
@@ -560,9 +665,20 @@ apiRouter.get('/sessions/:sessionId/distributions', (request, response) => {
     SELECT d.*,
            p.name AS patron_name,
            p.sex AS patron_sex,
+           p.age_range,
+           p.region AS patron_region,
+           p.province AS patron_province,
+           p.city AS patron_city,
+           p.sector,
+           p.purpose,
+           ses.location_region,
+           ses.location_province,
+           ses.location_city,
+           ses.location_details,
            s.name AS staff_name
     FROM distributions d
     JOIN patrons p ON p.id = d.patron_id
+    LEFT JOIN sessions ses ON ses.id = d.session_id
     LEFT JOIN staff s ON s.id = d.distributed_by_staff_id
     WHERE d.session_id = ?
     ORDER BY d.created_at DESC
@@ -604,7 +720,9 @@ apiRouter.post('/distributions/:id/correct', (request, response) => {
   if (!body) return
   body.name = normalizePersonName(body.name)
   const existing = db.prepare(`
-    SELECT d.*, p.name AS patron_name, p.sex AS patron_sex
+    SELECT d.*, p.name AS patron_name, p.sex AS patron_sex,
+           p.age_range, p.region, p.province, p.city, p.sector, p.purpose,
+           p.privacy_notice_accepted_at
     FROM distributions d
     JOIN patrons p ON p.id = d.patron_id
     WHERE d.id = ?
@@ -633,7 +751,19 @@ apiRouter.post('/distributions/:id/correct', (request, response) => {
   const correction = db.transaction(() => {
     db.prepare('UPDATE distributions SET is_voided = 1, void_reason = ? WHERE id = ?')
       .run('Superseded by corrected transaction', request.params.id)
-    db.prepare('INSERT INTO patrons (id, name, sex) VALUES (?, ?, ?)').run(patronId, body.name, body.sex)
+    db.prepare(`
+      INSERT INTO patrons (id, name, sex, age_range, region, province, city, sector, purpose, privacy_notice_accepted_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      patronId, body.name, body.sex,
+      body.ageRange ?? existing.age_range,
+      body.region ?? existing.region,
+      body.province ?? existing.province,
+      body.city ?? existing.city,
+      body.sector ?? existing.sector,
+      body.purpose ?? existing.purpose,
+      existing.privacy_notice_accepted_at ?? null,
+    )
     db.prepare(`
       INSERT INTO distributions (
         id, session_id, patron_id, distributed_at, distributed_by_staff_id,
@@ -753,10 +883,71 @@ apiRouter.get('/dashboard/summary', (request, response) => {
     }
   }
 
+  function visitorProfile(sessionId?: string) {
+    const sessionFilter = sessionId ? 'AND d.session_id = ?' : ''
+    const params: unknown[] = sessionId ? [sessionId] : []
+    params.push(...dateParams)
+
+    function breakdown(expression: string, limit?: number) {
+      const rows = db.prepare(`
+        SELECT COALESCE(NULLIF(trim(${expression}), ''), 'Not recorded') AS label,
+               COUNT(DISTINCT d.id) AS visits
+        FROM distributions d
+        JOIN patrons p ON p.id = d.patron_id
+        WHERE d.is_voided = 0 ${sessionFilter} ${dateFilter}
+        GROUP BY label
+        ORDER BY visits DESC, label COLLATE NOCASE
+      `).all(...params) as Array<{ label: string; visits: number }>
+      if (limit === undefined || rows.length <= limit) return rows
+
+      const visible = rows.slice(0, limit)
+      const notRecorded = rows.find((row) => row.label === 'Not recorded')
+      if (notRecorded && !visible.some((row) => row.label === 'Not recorded')) {
+        visible[visible.length - 1] = notRecorded
+      }
+      return visible
+    }
+
+    const total = db.prepare(`
+      SELECT COUNT(DISTINCT d.id) AS visits
+      FROM distributions d
+      WHERE d.is_voided = 0 ${sessionFilter} ${dateFilter}
+    `).get(...params) as { visits: number }
+
+    const ageRange = breakdown('p.age_range')
+    const ageOrder = ['0–12', '13–17', '18–24', '25–34', '35–44', '45–54', '55–64', '65+', 'Not recorded']
+    const ageIndex = (label: string) => {
+      const index = ageOrder.indexOf(label)
+      return index < 0 ? ageOrder.length : index
+    }
+    ageRange.sort((left, right) => ageIndex(left.label) - ageIndex(right.label))
+
+    return {
+      visits: Number(total.visits),
+      sex: breakdown('p.sex'),
+      ageRange,
+      sector: breakdown('p.sector'),
+      purpose: breakdown('p.purpose', 8),
+      location: breakdown(`
+        CASE
+          WHEN NULLIF(trim(p.city), '') IS NOT NULL AND NULLIF(trim(p.province), '') IS NOT NULL
+            THEN trim(p.city) || ', ' || trim(p.province)
+          WHEN NULLIF(trim(p.city), '') IS NOT NULL THEN trim(p.city)
+          WHEN NULLIF(trim(p.province), '') IS NOT NULL THEN trim(p.province)
+          ELSE 'Not recorded'
+        END
+      `, 8),
+    }
+  }
+
   const overall = { ...scopedSummary(), sessions: sessions.length }
   const exhibit = selectedSession
     ? { ...scopedSummary(String(selectedSession.id)), session: selectedSession }
     : null
+  const profiles = {
+    overall: visitorProfile(),
+    exhibit: selectedSession ? visitorProfile(String(selectedSession.id)) : null,
+  }
 
   const exhibitParams = selectedSession ? [selectedSession.id] : []
   const exhibitFilter = selectedSession ? 'AND d.session_id = ?' : ''
@@ -801,11 +992,11 @@ apiRouter.get('/dashboard/summary', (request, response) => {
            COUNT(DISTINCT d.id) AS transactions,
            COALESCE(SUM(de.quantity), 0) AS copies
     FROM sessions s
-    LEFT JOIN distributions d ON d.session_id = s.id AND d.is_voided = 0
+    LEFT JOIN distributions d ON d.session_id = s.id AND d.is_voided = 0 ${dateFilter}
     LEFT JOIN distribution_entries de ON de.distribution_id = d.id
     GROUP BY s.id, s.name, s.status
     ORDER BY s.created_at DESC
-  `).all() as Array<{ id: string; name: string; status: string; transactions: number; copies: number }>
+  `).all(...dateParams) as Array<{ id: string; name: string; status: string; transactions: number; copies: number }>
 
   const recent = db.prepare(`
     SELECT d.id, d.distributed_at,
@@ -837,6 +1028,7 @@ apiRouter.get('/dashboard/summary', (request, response) => {
   response.json({
     overall,
     exhibit,
+    profiles,
     sessions,
     trend,
     materials,
@@ -860,6 +1052,12 @@ apiRouter.get('/sessions/:sessionId/export', async (request, response) => {
     SELECT d.distributed_at,
            p.name AS patron_name,
            p.sex AS patron_sex,
+           p.age_range,
+           p.region AS patron_region,
+           p.province AS patron_province,
+           p.city AS patron_city,
+           p.sector,
+           p.purpose,
            COALESCE(de.material_title_snapshot, m.title, de.author_editor_snapshot) AS iec_title,
            de.quantity,
            s.name AS staff_name
@@ -876,21 +1074,31 @@ apiRouter.get('/sessions/:sessionId/export', async (request, response) => {
   workbook.creator = 'IDEA'
   workbook.created = new Date()
   const worksheet = workbook.addWorksheet('Distribution')
-  worksheet.addRow(['EVENT INFORMATION', 'PATRON INFORMATION', 'PATRON INFORMATION', 'IEC INFORMATION', 'IEC INFORMATION', 'IEC INFORMATION'])
+  worksheet.addRow(['EVENT INFORMATION', 'PATRON INFORMATION', 'PATRON INFORMATION', 'IEC INFORMATION', 'IEC INFORMATION', 'IEC INFORMATION', 'ADDITIONAL INFORMATION'])
   worksheet.mergeCells('A1:A2')
   worksheet.mergeCells('B1:C1')
   worksheet.mergeCells('D1:F1')
-  worksheet.addRow(['Date Distributed', 'Name', 'Sex', 'Author / Editor', 'No. of Physical Copies Distributed', 'Distributed By'])
+  worksheet.mergeCells('G1:L1')
+  worksheet.addRow([
+    'Date Distributed', 'Name', 'Sex', 'Author / Editor', 'No. of Physical Copies Distributed', 'Distributed By',
+    'Age Range', 'Region', 'Province', 'City', 'Sector', 'Purpose of IECs',
+  ])
 
   for (const row of rows as Array<Record<string, unknown>>) {
     const date = new Date(String(row.distributed_at))
     worksheet.addRow([
       Number.isNaN(date.getTime()) ? row.distributed_at : date,
-      row.patron_name,
+      invertPersonName(String(row.patron_name ?? '')),
       row.patron_sex,
       row.iec_title,
       row.quantity,
       row.staff_name ?? '',
+      row.age_range ?? '',
+      row.patron_region ?? '',
+      row.patron_province ?? '',
+      row.patron_city ?? '',
+      row.sector ?? '',
+      row.purpose ?? '',
     ])
   }
 
@@ -905,9 +1113,15 @@ apiRouter.get('/sessions/:sessionId/export', async (request, response) => {
     { width: 36 },
     { width: 34 },
     { width: 24 },
+    { width: 14 },
+    { width: 28 },
+    { width: 28 },
+    { width: 28 },
+    { width: 18 },
+    { width: 32 },
   ]
   worksheet.getColumn(1).numFmt = 'yyyy-mm-dd hh:mm'
-  worksheet.autoFilter = 'A2:F2'
+  worksheet.autoFilter = 'A2:L2'
   worksheet.views = [{ state: 'frozen', ySplit: 2 }]
 
   response.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')

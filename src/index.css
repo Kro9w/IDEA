@@ -1,16 +1,18 @@
 :root {
   /* Brand palette */
-  --blue: #1139CB;
-  --blue-strong: #0D2DA3;
+  --blue: #1139cb;
+  --blue-strong: #0d2da3;
   --blue-muted: rgba(17, 57, 203, 0.68);
   --blue-faint: rgba(17, 57, 203, 0.08);
   --blue-line: rgba(17, 57, 203, 0.24);
-  --accent: #ECA72C;
+  --accent: #eca72c;
   --accent-muted: rgba(236, 167, 44, 0.18);
-  --cream: #FBFFF1;
+  --cream: #fbfff1;
   --cream-muted: rgba(251, 255, 241, 0.78);
-  --danger: #B83232;
-  --danger-muted: rgba(184, 50, 50, 0.10);
+  --cream-line: rgba(251, 255, 241, 0.24);
+  --cream-faint: rgba(251, 255, 241, 0.1);
+  --danger: #b83232;
+  --danger-muted: rgba(184, 50, 50, 0.1);
 
   /* Semantic aliases */
   --ink: var(--blue);
@@ -31,7 +33,7 @@
   --overlay: var(--blue-muted);
 
   /* Swiss type scale */
-  --font-sans: 'Inter', sans-serif;
+  --font-sans: "Inter Variable", "Inter", system-ui, sans-serif;
   --type-xs: 0.75rem;
   --type-sm: 0.875rem;
   --type-base: 1rem;
@@ -71,16 +73,28 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+}
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
   line-height: 1.55;
 }
-button, input, select { font: inherit; }
-button, a { -webkit-tap-highlight-color: transparent; }
-img { display: block; max-width: 100%; }
+button,
+input,
+select {
+  font: inherit;
+}
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+img {
+  display: block;
+  max-width: 100%;
+}
 button:focus-visible,
 a:focus-visible {
   outline: 3px solid var(--focus);
